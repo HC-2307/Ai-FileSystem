@@ -1,0 +1,10 @@
+build/
+*.db
+*.sqlite
+*.sqlite3
+*.img
+*.bin
+__pycache__/
+.venv/
+venv/
+.env
