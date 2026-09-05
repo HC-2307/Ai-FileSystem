@@ -1,5 +1,6 @@
 #include<fstream>
 #include <vector>
+#include <string>
 using namespace std;
 
 
@@ -12,21 +13,8 @@ private:
     int blockCount;
 
 public:
-    void create(string filename, int blockCount){
-
-    }
-
-    void open(string filename){
-
-    }
-
-    void writeBlock(int blockNumber, vector<char> data){
-
-    }
-
-    vector<char> readBlock(int blockNumber){
-
-    }
-
-
+    void create(string filename, int blockCount);
+    void open(string filename){;
+    void writeBlock(int blockNumber, vector<char> data);
+    vector<char> readBlock(int blockNumber);
 };
