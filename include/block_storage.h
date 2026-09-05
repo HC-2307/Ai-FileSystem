@@ -14,7 +14,7 @@ private:
 
 public:
     void create(string filename, int blockCount);
-    void open(string filename){;
+    void open(string filename);
     void writeBlock(int blockNumber, vector<char> data);
     vector<char> readBlock(int blockNumber);
 };
