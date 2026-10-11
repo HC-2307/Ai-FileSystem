@@ -178,6 +178,38 @@ static void last_block_of_large_image() {
     std::remove(path);
 }
 
+static void direct_mode_round_trips() {
+    const char* path = "test_direct.img";
+    std::remove(path);
+    block_storage s;
+    s.create(path, 4, io_mode::direct);
+    CHECK(s.getMode() == io_mode::direct);
+    std::vector<char> data(4096, 'd');
+    s.writeBlock(3, data);
+    CHECK(s.readBlock(3) == data);
+    CHECK(s.readBlock(0) == std::vector<char>(4096, 0));
+    std::remove(path);
+}
+
+static void direct_and_buffered_see_the_same_data() {
+    const char* path = "test_mixed.img";
+    std::remove(path);
+    { block_storage s; s.create(path, 2, io_mode::direct); s.writeBlock(1, std::vector<char>(4096, 'm')); }
+    { block_storage s; s.open(path);                    CHECK(s.readBlock(1) == std::vector<char>(4096, 'm')); }
+    { block_storage s; s.open(path, io_mode::direct);   CHECK(s.readBlock(1) == std::vector<char>(4096, 'm')); }
+    std::remove(path);
+}
+
+static void mode_defaults_to_buffered() {
+    const char* path = "test_mode.img";
+    std::remove(path);
+    block_storage s;
+    CHECK(s.getMode() == io_mode::buffered);
+    s.create(path, 1);
+    CHECK(s.getMode() == io_mode::buffered);
+    std::remove(path);
+}
+
 #define RUN(test)                              \
     do {                                       \
         std::cout << #test << std::endl;       \
@@ -200,5 +232,8 @@ int main() {
     RUN(out_of_range_block_throws);
     RUN(io_on_closed_storage_throws);
     RUN(last_block_of_large_image);
+    RUN(direct_mode_round_trips);
+    RUN(direct_and_buffered_see_the_same_data);
+    RUN(mode_defaults_to_buffered);
     return 0;
 }
