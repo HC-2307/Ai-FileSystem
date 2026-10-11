@@ -1,20 +1,25 @@
-#include<fstream>
-#include <vector>
+#pragma once
+#include <cstddef>
+#include <cstdint>
 #include <string>
-using namespace std;
+#include <vector>
 
-
-class block_storage{
-private:
-    fstream file;
-    string filename;
-
-    static const int BLOCK_SIZE = 4096;
-    int blockCount;
-
+class block_storage {
 public:
-    void create(string filename, int blockCount);
-    void open(string filename);
-    void writeBlock(int blockNumber, vector<char> data);
-    vector<char> readBlock(int blockNumber);
+    static constexpr std::size_t BLOCK_SIZE = 4096;
+
+    block_storage() = default;
+    ~block_storage();
+    block_storage(const block_storage&) = delete;
+    block_storage& operator=(const block_storage&) = delete;
+
+    void create(const std::string& filename, std::uint32_t blockCount);
+    void open(const std::string& filename);
+    void close();
+    bool isOpen() const;
+    std::uint32_t getBlockCount() const;
+
+private:
+    int fd = -1;
+    std::uint32_t blockCount = 0;
 };
