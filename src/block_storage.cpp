@@ -1,6 +1,7 @@
 #include "block_storage.h"
 
 #include <cerrno>
+#include <cstring>
 #include <stdexcept>
 #include <system_error>
 
@@ -10,6 +11,38 @@
 
 static std::system_error sysError(const std::string& what) {
     return std::system_error(errno, std::generic_category(), what);
+}
+
+// Transfer exactly one block. pread/pwrite may move fewer bytes than asked,
+// so loop until the block is complete. `direct` is unused until direct I/O lands.
+static void readFully(int fd, char* buf, off_t offset, bool direct) {
+    (void)direct;
+    std::size_t done = 0;
+    while (done < block_storage::BLOCK_SIZE) {
+        ssize_t n = ::pread(fd, buf + done, block_storage::BLOCK_SIZE - done, offset + off_t(done));
+        if (n == -1) {
+            if (errno == EINTR) continue;
+            throw sysError("pread");
+        }
+        if (n == 0) {
+            errno = EIO;
+            throw sysError("pread: image shorter than expected");
+        }
+        done += std::size_t(n);
+    }
+}
+
+static void writeFully(int fd, const char* buf, off_t offset, bool direct) {
+    (void)direct;
+    std::size_t done = 0;
+    while (done < block_storage::BLOCK_SIZE) {
+        ssize_t n = ::pwrite(fd, buf + done, block_storage::BLOCK_SIZE - done, offset + off_t(done));
+        if (n == -1) {
+            if (errno == EINTR) continue;
+            throw sysError("pwrite");
+        }
+        done += std::size_t(n);
+    }
 }
 
 block_storage::~block_storage() {
@@ -69,4 +102,27 @@ bool block_storage::isOpen() const {
 
 std::uint32_t block_storage::getBlockCount() const {
     return blockCount;
+}
+
+off_t block_storage::checkedOffset(std::uint32_t blockNumber) const {
+    if (!isOpen()) throw std::logic_error("block_storage not open");
+    if (blockNumber >= blockCount) throw std::out_of_range("block number out of range");
+    return off_t(blockNumber) * off_t(BLOCK_SIZE);
+}
+
+void block_storage::writeBlock(std::uint32_t blockNumber, const std::vector<char>& data) {
+    off_t offset = checkedOffset(blockNumber);
+    if (data.size() > BLOCK_SIZE) throw std::invalid_argument("data larger than a block");
+
+    alignas(BLOCK_SIZE) char buf[BLOCK_SIZE] = {};
+    if (!data.empty()) std::memcpy(buf, data.data(), data.size());
+    writeFully(fd, buf, offset, false);
+}
+
+std::vector<char> block_storage::readBlock(std::uint32_t blockNumber) {
+    off_t offset = checkedOffset(blockNumber);
+
+    alignas(BLOCK_SIZE) char buf[BLOCK_SIZE];
+    readFully(fd, buf, offset, false);
+    return std::vector<char>(buf, buf + BLOCK_SIZE);
 }

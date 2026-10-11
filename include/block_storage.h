@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include <sys/types.h>
+
 class block_storage {
 public:
     static constexpr std::size_t BLOCK_SIZE = 4096;
@@ -19,7 +21,13 @@ public:
     bool isOpen() const;
     std::uint32_t getBlockCount() const;
 
+    // Data shorter than BLOCK_SIZE is zero-padded; longer data is rejected.
+    void writeBlock(std::uint32_t blockNumber, const std::vector<char>& data);
+    std::vector<char> readBlock(std::uint32_t blockNumber);
+
 private:
+    off_t checkedOffset(std::uint32_t blockNumber) const;
+
     int fd = -1;
     std::uint32_t blockCount = 0;
 };
