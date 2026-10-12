@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <sstream>
 #include <stdexcept>
@@ -13,6 +14,13 @@ namespace {
 
 const std::int64_t ROOT = 1;
 const std::uint64_t BS = block_storage::BLOCK_SIZE;
+const std::uint64_t MAX_FILE_BYTES = BS << 32;   // block indexes are 32-bit
+const std::size_t INDEX_ENTRY_BYTES = 64;        // key, block number, list links and hash node
+const unsigned PREFETCH_THREADS = 4;
+const std::size_t LOG_BATCH = 4096;
+const std::uint64_t ADAPT_EVERY = 256;           // block reads between policy updates
+const int READ_AHEAD_MAPPINGS = 32;
+const int WARM_UP_READS = 50000;
 
 const char* SCHEMA =
     "CREATE TABLE inodes ("
@@ -24,6 +32,12 @@ const char* SCHEMA =
     "  PRIMARY KEY (inode, idx));"
     "CREATE TABLE free_blocks (block INTEGER PRIMARY KEY);"
     "INSERT INTO inodes (id, parent, name, is_dir) VALUES (1, 0, '', 1);";
+
+// Created on open as well, so images formatted before monitoring existed still work.
+const char* LOG_SCHEMA =
+    "CREATE TABLE IF NOT EXISTS access_log ("
+    "  seq INTEGER PRIMARY KEY, inode INTEGER NOT NULL, idx INTEGER NOT NULL,"
+    "  is_write INTEGER NOT NULL)";
 
 [[noreturn]] void fail(int code, const std::string& what) {
     throw std::system_error(code, std::generic_category(), what);
@@ -61,6 +75,7 @@ public:
         if (rc == SQLITE_DONE) return false;
         dbFail(db);
     }
+    void reset() { sqlite3_reset(st); }
     std::int64_t integer(int col) { return sqlite3_column_int64(st, col); }
     std::string text(int col) { return reinterpret_cast<const char*>(sqlite3_column_text(st, col)); }
 
@@ -117,18 +132,17 @@ node lookup(sqlite3* db, const std::string& path) {
     return walk(db, split(path));
 }
 
-// Block number holding block `idx` of the file, or -1 for a hole.
-std::int64_t mappedBlock(sqlite3* db, std::int64_t inode, std::uint64_t idx) {
-    statement q(db, "SELECT block FROM file_blocks WHERE inode = ? AND idx = ?");
-    return q.bindInt(1, inode).bindInt(2, std::int64_t(idx)).step() ? q.integer(0) : -1;
-}
-
 std::int64_t allocateBlock(sqlite3* db) {
     statement q(db, "DELETE FROM free_blocks WHERE block = (SELECT MIN(block) FROM free_blocks) RETURNING block");
     if (!q.step()) fail(ENOSPC, "no free blocks");
     std::int64_t block = q.integer(0);
     q.step();   // run the DELETE to completion
     return block;
+}
+
+std::uint64_t nanosSince(std::chrono::steady_clock::time_point start) {
+    return std::uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
 }
 
 }  // namespace
@@ -138,18 +152,21 @@ filesystem::~filesystem() {
 }
 
 void filesystem::format(const std::string& imagePath, const std::string& dbPath, std::uint32_t blockCount,
-                        io_mode mode) {
+                        const fs_options& options) {
     if (db) throw std::logic_error("filesystem already open");
-    storage.create(imagePath, blockCount, mode);
+    storage.create(imagePath, blockCount, options.mode);
     try {
         if (sqlite3_open(dbPath.c_str(), &db) != SQLITE_OK) dbFail(db);
-        transaction t(db);
-        exec(db, SCHEMA);
-        statement fill(db,
-                       "WITH RECURSIVE n(b) AS (SELECT 0 UNION ALL SELECT b + 1 FROM n WHERE b + 1 < ?)"
-                       " INSERT INTO free_blocks SELECT b FROM n");
-        fill.bindInt(1, blockCount).step();
-        t.commit();
+        {
+            transaction t(db);
+            exec(db, SCHEMA);
+            statement fill(db,
+                           "WITH RECURSIVE n(b) AS (SELECT 0 UNION ALL SELECT b + 1 FROM n WHERE b + 1 < ?)"
+                           " INSERT INTO free_blocks SELECT b FROM n");
+            fill.bindInt(1, blockCount).step();
+            t.commit();
+        }
+        start(options);
     } catch (...) {
         close();
         std::remove(imagePath.c_str());   // the image was created by this call
@@ -157,20 +174,48 @@ void filesystem::format(const std::string& imagePath, const std::string& dbPath,
     }
 }
 
-void filesystem::open(const std::string& imagePath, const std::string& dbPath, io_mode mode) {
+void filesystem::open(const std::string& imagePath, const std::string& dbPath, const fs_options& options) {
     if (db) throw std::logic_error("filesystem already open");
-    storage.open(imagePath, mode);
+    storage.open(imagePath, options.mode);
     try {
         if (sqlite3_open_v2(dbPath.c_str(), &db, SQLITE_OPEN_READWRITE, nullptr) != SQLITE_OK) dbFail(db);
-        statement root(db, "SELECT 1 FROM inodes WHERE id = 1");
-        if (!root.step()) throw std::runtime_error(dbPath + " is not a filesystem database");
+        {
+            statement root(db, "SELECT 1 FROM inodes WHERE id = 1");
+            if (!root.step()) throw std::runtime_error(dbPath + " is not a filesystem database");
+        }
+        start(options);
     } catch (...) {
         close();
         throw;
     }
 }
 
+void filesystem::start(const fs_options& chosen) {
+    options = chosen;
+    exec(db, LOG_SCHEMA);
+    tuning = policy{};
+    guesser = predictor{};
+    guesser.calibrate = options.version == fs_version::adaptive;
+    counters = fs_stats{};
+    lastCache = cache_stats{};
+    lastIndexGhostHits = blockReads = 0;
+    cache.start(1, options.version == fs_version::baseline ? 0 : PREFETCH_THREADS);
+    resize();
+    if (options.version == fs_version::baseline) return;
+
+    // Teach the predictor the reads recorded by earlier sessions.
+    statement past(db,
+                   "SELECT inode, idx FROM (SELECT seq, inode, idx FROM access_log WHERE is_write = 0"
+                   " ORDER BY seq DESC LIMIT ?) ORDER BY seq");
+    past.bindInt(1, WARM_UP_READS);
+    while (past.step()) guesser.observe(past.integer(0), std::uint64_t(past.integer(1)), 0);
+}
+
 void filesystem::close() {
+    if (db) flushLog();
+    cache.stop();
+    index.clear();
+    indexGhost.clear();
     sqlite3_close(db);   // no-op on nullptr
     db = nullptr;
     storage.close();
@@ -198,16 +243,97 @@ void filesystem::mkdir(const std::string& path) {
     create(path, true);
 }
 
+// Deletes a file or empty directory. The caller holds the transaction.
+void filesystem::unlink(std::int64_t id, const std::string& path) {
+    statement child(db, "SELECT 1 FROM inodes WHERE parent = ? LIMIT 1");
+    if (child.bindInt(1, id).step()) fail(ENOTEMPTY, path);
+    {
+        statement owned(db, "SELECT block FROM file_blocks WHERE inode = ?");
+        owned.bindInt(1, id);
+        while (owned.step()) cache.invalidate(std::uint32_t(owned.integer(0)));
+    }
+    statement(db, "INSERT INTO free_blocks SELECT block FROM file_blocks WHERE inode = ?").bindInt(1, id).step();
+    statement(db, "DELETE FROM file_blocks WHERE inode = ?").bindInt(1, id).step();
+    statement(db, "DELETE FROM inodes WHERE id = ?").bindInt(1, id).step();
+    forgetMappings();
+}
+
 void filesystem::remove(const std::string& path) {
     node n = lookup(db, path);
     if (n.id == ROOT) fail(EBUSY, path);
-    statement child(db, "SELECT 1 FROM inodes WHERE parent = ? LIMIT 1");
-    if (child.bindInt(1, n.id).step()) fail(ENOTEMPTY, path);
+    transaction t(db);
+    unlink(n.id, path);
+    t.commit();
+}
+
+void filesystem::rename(const std::string& from, const std::string& to) {
+    node src = lookup(db, from);
+    if (src.id == ROOT) fail(EBUSY, from);
+    std::vector<std::string> parts = split(to);
+    if (parts.empty()) fail(EBUSY, to);
+    std::string name = parts.back();
+    parts.pop_back();
+    node parent = walk(db, parts);
+    if (!parent.isDir) fail(ENOTDIR, to);
+
+    // A directory cannot move into itself or anything below it.
+    for (std::int64_t at = parent.id; at != ROOT;) {
+        if (at == src.id) fail(EINVAL, to);
+        statement up(db, "SELECT parent FROM inodes WHERE id = ?");
+        if (!up.bindInt(1, at).step()) break;
+        at = up.integer(0);
+    }
 
     transaction t(db);
-    statement(db, "INSERT INTO free_blocks SELECT block FROM file_blocks WHERE inode = ?").bindInt(1, n.id).step();
-    statement(db, "DELETE FROM file_blocks WHERE inode = ?").bindInt(1, n.id).step();
-    statement(db, "DELETE FROM inodes WHERE id = ?").bindInt(1, n.id).step();
+    std::int64_t replaced = 0;
+    bool replacedIsDir = false;
+    {
+        statement old(db, "SELECT id, is_dir FROM inodes WHERE parent = ? AND name = ?");
+        if (old.bindInt(1, parent.id).bindText(2, name).step()) {
+            replaced = old.integer(0);
+            replacedIsDir = old.integer(1) != 0;
+        }
+    }
+    if (replaced == src.id) return;   // onto itself
+    if (replaced) {
+        if (replacedIsDir != src.isDir) fail(replacedIsDir ? EISDIR : ENOTDIR, to);
+        unlink(replaced, to);
+    }
+    statement move(db, "UPDATE inodes SET parent = ?, name = ? WHERE id = ?");
+    move.bindInt(1, parent.id).bindText(2, name).bindInt(3, src.id).step();
+    t.commit();
+}
+
+void filesystem::truncate(const std::string& path, std::uint64_t size) {
+    node n = lookup(db, path);
+    if (n.isDir) fail(EISDIR, path);
+    if (size > MAX_FILE_BYTES) fail(EFBIG, path);
+    if (size == n.size) return;
+
+    transaction t(db);
+    if (size < n.size) {
+        const std::uint64_t keep = (size + BS - 1) / BS;   // blocks that still hold data
+        {
+            statement gone(db, "SELECT block FROM file_blocks WHERE inode = ? AND idx >= ?");
+            gone.bindInt(1, n.id).bindInt(2, std::int64_t(keep));
+            while (gone.step()) cache.invalidate(std::uint32_t(gone.integer(0)));
+        }
+        statement(db, "INSERT INTO free_blocks SELECT block FROM file_blocks WHERE inode = ? AND idx >= ?")
+            .bindInt(1, n.id).bindInt(2, std::int64_t(keep)).step();
+        statement(db, "DELETE FROM file_blocks WHERE inode = ? AND idx >= ?")
+            .bindInt(1, n.id).bindInt(2, std::int64_t(keep)).step();
+        forgetMappings();
+
+        // Bytes past the new end must read as zeros if the file grows again.
+        std::int64_t last = size % BS ? blockOf(n.id, keep - 1) : -1;
+        if (last >= 0) {
+            std::vector<char> buf = cache.read(std::uint32_t(last));
+            std::fill(buf.begin() + size % BS, buf.end(), 0);
+            cache.write(std::uint32_t(last), buf);
+        }
+    }
+    statement resize(db, "UPDATE inodes SET size = ? WHERE id = ?");
+    resize.bindInt(1, std::int64_t(size)).bindInt(2, n.id).step();
     t.commit();
 }
 
@@ -227,40 +353,50 @@ file_info filesystem::stat(const std::string& path) {
 }
 
 void filesystem::write(const std::string& path, std::uint64_t offset, const std::vector<char>& data) {
+    if (log.size() >= LOG_BATCH) flushLog();
     node n = lookup(db, path);
     if (n.isDir) fail(EISDIR, path);
     if (data.empty()) return;
+    const std::uint64_t end = offset + data.size();
+    if (end > MAX_FILE_BYTES || end < offset) fail(EFBIG, path);
 
     // shortcut: metadata is rolled back on failure but blocks already overwritten
     // are not; needs a journal if the project ever claims crash consistency.
     transaction t(db);
-    const std::uint64_t end = offset + data.size();
-    for (std::uint64_t pos = offset; pos < end;) {
-        const std::uint64_t idx = pos / BS, in = pos % BS;
-        const std::uint64_t len = std::min(BS - in, end - pos);
+    try {
+        for (std::uint64_t pos = offset; pos < end;) {
+            const std::uint64_t idx = pos / BS, in = pos % BS;
+            const std::uint64_t len = std::min(BS - in, end - pos);
+            record(n.id, idx, true);
 
-        std::vector<char> buf(BS, 0);
-        std::int64_t block = mappedBlock(db, n.id, idx);
-        if (block < 0) {
-            // A recycled block still holds its old owner's bytes, so start from zeros.
-            block = allocateBlock(db);
-            statement map(db, "INSERT INTO file_blocks (inode, idx, block) VALUES (?, ?, ?)");
-            map.bindInt(1, n.id).bindInt(2, std::int64_t(idx)).bindInt(3, block).step();
-        } else if (len < BS) {
-            buf = storage.readBlock(std::uint32_t(block));
+            std::vector<char> buf(BS, 0);
+            std::int64_t block = blockOf(n.id, idx);
+            if (block < 0) {
+                // A recycled block still holds its old owner's bytes, so start from zeros.
+                block = allocateBlock(db);
+                statement map(db, "INSERT INTO file_blocks (inode, idx, block) VALUES (?, ?, ?)");
+                map.bindInt(1, n.id).bindInt(2, std::int64_t(idx)).bindInt(3, block).step();
+                remember(blockKey(n.id, idx), block);
+            } else if (len < BS) {
+                buf = cache.read(std::uint32_t(block));
+            }
+            std::copy_n(data.begin() + (pos - offset), len, buf.begin() + in);
+            cache.write(std::uint32_t(block), buf);
+            pos += len;
         }
-        std::copy_n(data.begin() + (pos - offset), len, buf.begin() + in);
-        storage.writeBlock(std::uint32_t(block), buf);
-        pos += len;
+        if (end > n.size) {
+            statement grow(db, "UPDATE inodes SET size = ? WHERE id = ?");
+            grow.bindInt(1, std::int64_t(end)).bindInt(2, n.id).step();
+        }
+        t.commit();
+    } catch (...) {
+        forgetMappings();   // they may name blocks the rollback is about to free
+        throw;
     }
-    if (end > n.size) {
-        statement grow(db, "UPDATE inodes SET size = ? WHERE id = ?");
-        grow.bindInt(1, std::int64_t(end)).bindInt(2, n.id).step();
-    }
-    t.commit();
 }
 
 std::vector<char> filesystem::read(const std::string& path, std::uint64_t offset, std::size_t size) {
+    if (log.size() >= LOG_BATCH) flushLog();
     node n = lookup(db, path);
     if (n.isDir) fail(EISDIR, path);
     if (offset >= n.size) return {};
@@ -270,12 +406,117 @@ std::vector<char> filesystem::read(const std::string& path, std::uint64_t offset
     for (std::uint64_t pos = offset; pos < end;) {
         const std::uint64_t idx = pos / BS, in = pos % BS;
         const std::uint64_t len = std::min(BS - in, end - pos);
-        std::int64_t block = mappedBlock(db, n.id, idx);
+        record(n.id, idx, false);
+        std::int64_t block = blockOf(n.id, idx);
         if (block >= 0) {   // holes stay zero
-            std::vector<char> buf = storage.readBlock(std::uint32_t(block));
+            std::vector<char> buf = cache.read(std::uint32_t(block));
             std::copy_n(buf.begin() + in, len, out.begin() + (pos - offset));
         }
+        if (options.version != fs_version::baseline) anticipate(n.id, idx);
+        if (options.version == fs_version::adaptive && ++blockReads % ADAPT_EVERY == 0) adapt();
         pos += len;
     }
     return out;
+}
+
+fs_stats filesystem::stats() {
+    fs_stats s = counters;
+    s.cache = cache.stats();
+    s.memoryBytes = cache.size() * BS + index.size() * INDEX_ENTRY_BYTES;
+    s.threshold = tuning.threshold;
+    s.depth = tuning.depth;
+    s.dataShare = tuning.dataShare;
+    return s;
+}
+
+// Block number holding block `idx` of the file, or -1 for a hole. With
+// readAhead, a miss also loads the mappings that follow in the same query.
+std::int64_t filesystem::blockOf(std::int64_t inode, std::uint64_t idx, bool readAhead) {
+    const std::uint64_t key = blockKey(inode, idx);
+    if (std::int64_t* known = index.get(key)) {
+        counters.indexHits++;
+        return *known;
+    }
+    counters.indexMisses++;
+    if (indexGhost.contains(key)) counters.indexGhostHits++;
+
+    auto begin = std::chrono::steady_clock::now();
+    std::vector<std::int64_t> found(readAhead ? READ_AHEAD_MAPPINGS : 1, -1);
+    statement q(db, "SELECT idx, block FROM file_blocks WHERE inode = ? AND idx >= ? AND idx < ?");
+    q.bindInt(1, inode).bindInt(2, std::int64_t(idx)).bindInt(3, std::int64_t(idx + found.size()));
+    while (q.step()) found[std::size_t(q.integer(0)) - idx] = q.integer(1);
+    counters.dbLookups++;
+    counters.dbLookupNanos += nanosSince(begin);
+
+    for (std::size_t i = found.size(); i-- > 0;) remember(blockKey(inode, idx + i), found[i]);   // idx ends up newest
+    return found[0];
+}
+
+void filesystem::remember(std::uint64_t key, std::int64_t block) {
+    indexGhost.erase(key);
+    for (const auto& dropped : index.put(key, block)) indexGhost.put(dropped.first, 0);
+}
+
+// shortcut: drops every cached mapping, not only the affected file's; fine
+// while deletes and truncates are rare, key the cache per file if they are not.
+void filesystem::forgetMappings() {
+    index.clear();
+    indexGhost.clear();
+}
+
+// Feeds the read to the predictor and prefetches what it is confident about.
+void filesystem::anticipate(std::int64_t inode, std::uint64_t idx) {
+    const bool adaptive = options.version == fs_version::adaptive;
+    for (const prediction& p : guesser.observe(inode, idx, tuning.depth)) {
+        if (p.confidence < tuning.threshold) continue;
+        std::int64_t block = blockOf(p.inode, p.idx, adaptive);
+        if (block >= 0) cache.prefetch(std::uint32_t(block));
+    }
+}
+
+// Feedback step: looks at what happened since the last call and retunes.
+void filesystem::adapt() {
+    const cache_stats now = cache.stats();
+    tuning.learn(now.prefetchUsed - lastCache.prefetchUsed, now.prefetchWasted - lastCache.prefetchWasted);
+    tuning.rebalance(now.ghostHits - lastCache.ghostHits, counters.indexGhostHits - lastIndexGhostHits,
+                     now.diskReads ? double(now.diskReadNanos) / now.diskReads : 0,
+                     counters.dbLookups ? double(counters.dbLookupNanos) / counters.dbLookups : 0,
+                     index.size(), index.capacity(), indexGhost.capacity());
+    lastCache = now;
+    lastIndexGhostHits = counters.indexGhostHits;
+    resize();
+}
+
+// Splits the memory budget between the two caches as the policy says.
+void filesystem::resize() {
+    const double bytes = double(options.cacheBytes);
+    auto blocksIn = [&](double share) { return std::max<std::size_t>(1, std::size_t(bytes * share / BS)); };
+    auto entriesIn = [&](double share) {
+        return std::max<std::size_t>(1, std::size_t(bytes * share / INDEX_ENTRY_BYTES));
+    };
+    cache.setCapacity(blocksIn(tuning.dataShare));
+    cache.setGhostCapacity(blocksIn(policy::STEP));
+    indexGhost.setCapacity(entriesIn(policy::STEP));
+    for (const auto& dropped : index.setCapacity(entriesIn(1 - tuning.dataShare))) indexGhost.put(dropped.first, 0);
+}
+
+void filesystem::record(std::int64_t inode, std::uint64_t idx, bool isWrite) {
+    log.push_back(access{inode, idx, isWrite});
+}
+
+// Monitoring must never fail a file operation, so errors only lose log rows.
+// shortcut: access_log grows without bound; trim old rows if mounts live long.
+void filesystem::flushLog() {
+    try {
+        if (log.empty()) return;
+        transaction t(db);
+        statement add(db, "INSERT INTO access_log (inode, idx, is_write) VALUES (?, ?, ?)");
+        for (const access& a : log) {
+            add.bindInt(1, a.inode).bindInt(2, std::int64_t(a.idx)).bindInt(3, a.isWrite).step();
+            add.reset();
+        }
+        t.commit();
+    } catch (...) {
+    }
+    log.clear();
 }

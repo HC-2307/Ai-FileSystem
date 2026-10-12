@@ -5,9 +5,13 @@
 #include <cerrno>
 #include <cstdio>
 #include <iostream>
+#include <map>
+#include <random>
 #include <string>
 #include <system_error>
 #include <vector>
+
+#include <sqlite3.h>
 
 #define CHECK_ERRNO(expr, want)                                            \
     do {                                                                   \
@@ -27,6 +31,7 @@
 
 static const char* IMG = "test_fs.img";
 static const char* DB = "test_fs.db";
+static fs_options OPTS;   // every test runs once per version
 
 static void cleanup() {
     std::remove(IMG);
@@ -36,7 +41,7 @@ static void cleanup() {
 // Fresh filesystem of `blocks` blocks, formatted into `fs`.
 static void fresh(filesystem& fs, std::uint32_t blocks = 16) {
     cleanup();
-    fs.format(IMG, DB, blocks);
+    fs.format(IMG, DB, blocks, OPTS);
 }
 
 static std::vector<char> bytes(std::size_t n, char c) {
@@ -54,7 +59,7 @@ static void format_refuses_existing_image() {
     { filesystem fs; fresh(fs); fs.createFile("/keep"); }
     filesystem fs;
     CHECK_ERRNO(fs.format(IMG, DB, 16), EEXIST);
-    fs.open(IMG, DB);
+    fs.open(IMG, DB, OPTS);
     CHECK(fs.list("/") == std::vector<std::string>{"keep"});   // untouched
 }
 
@@ -225,7 +230,7 @@ static void contents_survive_reopen() {
         fs.write("/d/f", 100, bytes(6000, 'p'));
     }
     filesystem fs;
-    fs.open(IMG, DB);
+    fs.open(IMG, DB, OPTS);
     CHECK(fs.stat("/d/f").size == 6100);
     CHECK(fs.read("/d/f", 100, 6000) == bytes(6000, 'p'));
 }
@@ -234,10 +239,158 @@ static void open_rejects_missing_database() {
     { filesystem fs; fresh(fs); }
     std::remove(DB);
     filesystem fs;
-    CHECK_THROWS(fs.open(IMG, DB), std::exception);
+    CHECK_THROWS(fs.open(IMG, DB, OPTS), std::exception);
     CHECK_THROWS(fs.stat("/"), std::logic_error);       // still closed
     FILE* stray = std::fopen(DB, "r");                  // open must not create it
     CHECK(stray == nullptr);
+}
+
+static void truncate_shrinks_and_frees_blocks() {
+    filesystem fs;
+    fresh(fs, 4);
+    fs.createFile("/f");
+    fs.write("/f", 0, bytes(4 * 4096, 'a'));
+    fs.truncate("/f", 5000);
+    CHECK(fs.stat("/f").size == 5000);
+    CHECK(fs.read("/f", 0, 9000) == bytes(5000, 'a'));
+    fs.createFile("/g");
+    fs.write("/g", 0, bytes(2 * 4096, 'b'));               // the two freed blocks
+    CHECK_ERRNO(fs.write("/g", 2 * 4096, bytes(1, 'b')), ENOSPC);
+    CHECK(fs.read("/f", 0, 9000) == bytes(5000, 'a'));
+}
+
+static void truncate_then_grow_reads_zeros() {
+    filesystem fs;
+    fresh(fs);
+    fs.createFile("/f");
+    fs.write("/f", 0, bytes(6000, 'a'));
+    fs.truncate("/f", 100);
+    fs.truncate("/f", 6000);
+    std::vector<char> want = bytes(100, 'a');
+    want.resize(6000, 0);
+    CHECK(fs.read("/f", 0, 6000) == want);
+    fs.truncate("/f", 0);
+    CHECK(fs.read("/f", 0, 10).empty());
+    CHECK_ERRNO(fs.truncate("/", 0), EISDIR);
+}
+
+static void rename_moves_and_replaces() {
+    filesystem fs;
+    fresh(fs, 4);
+    fs.mkdir("/d");
+    fs.createFile("/a");
+    fs.write("/a", 0, bytes(5000, 'a'));
+    fs.rename("/a", "/d/b");
+    CHECK_ERRNO(fs.stat("/a"), ENOENT);
+    CHECK(fs.read("/d/b", 0, 5000) == bytes(5000, 'a'));
+
+    fs.createFile("/c");
+    fs.write("/c", 0, bytes(2 * 4096, 'c'));               // image is now full
+    fs.rename("/d/b", "/c");                               // replaces /c and frees its blocks
+    CHECK(fs.read("/c", 0, 5000) == bytes(5000, 'a'));
+    CHECK(fs.list("/d").empty());
+    fs.createFile("/e");
+    fs.write("/e", 0, bytes(2 * 4096, 'e'));
+    fs.rename("/c", "/c");
+    CHECK(fs.stat("/c").size == 5000);
+}
+
+static void rename_rules() {
+    filesystem fs;
+    fresh(fs);
+    fs.mkdir("/d");
+    fs.mkdir("/d/sub");
+    fs.mkdir("/full");
+    fs.createFile("/full/x");
+    fs.createFile("/f");
+    CHECK_ERRNO(fs.rename("/missing", "/y"), ENOENT);
+    CHECK_ERRNO(fs.rename("/d", "/d/sub/d"), EINVAL);      // into itself
+    CHECK_ERRNO(fs.rename("/d", "/f"), ENOTDIR);
+    CHECK_ERRNO(fs.rename("/f", "/d"), EISDIR);
+    CHECK_ERRNO(fs.rename("/d", "/full"), ENOTEMPTY);
+    CHECK_ERRNO(fs.rename("/f", "/f/g"), ENOTDIR);
+    CHECK_ERRNO(fs.rename("/", "/r"), EBUSY);
+    fs.rename("/d", "/full/d");
+    CHECK(fs.stat("/full/d/sub").isDir);
+}
+
+// Random reads, writes and truncates with a cache far smaller than the data,
+// checked against plain in-memory copies of the files.
+static void contents_match_a_model_under_cache_pressure() {
+    fs_options small = OPTS;
+    small.cacheBytes = 32 * 1024;
+    cleanup();
+    filesystem fs;
+    fs.format(IMG, DB, 256, small);
+    std::vector<std::string> names = {"/a", "/b", "/c"};
+    std::map<std::string, std::vector<char>> model;
+    for (const std::string& name : names) fs.createFile(name);
+
+    std::mt19937 rng(7);
+    for (int i = 0; i < 600; i++) {
+        const std::string& name = names[rng() % names.size()];
+        std::vector<char>& want = model[name];
+        const int op = rng() % 20;
+        if (op == 0) {
+            std::size_t size = rng() % (60 * 4096);
+            fs.truncate(name, size);
+            want.resize(size, 0);
+        } else if (op < 6) {
+            std::size_t offset = rng() % (60 * 4096), n = 1 + rng() % 9000;
+            std::vector<char> data(n, char('a' + i % 26));
+            fs.write(name, offset, data);
+            if (want.size() < offset + n) want.resize(offset + n, 0);
+            std::copy(data.begin(), data.end(), want.begin() + offset);
+        } else {
+            // Mostly walk forward so the predictor has something to find.
+            std::size_t offset = op < 16 ? std::size_t(i % 60) * 4096 : rng() % (64 * 4096), n = 1 + rng() % 9000;
+            std::vector<char> expect;
+            if (offset < want.size())
+                expect.assign(want.begin() + offset, want.begin() + std::min(want.size(), offset + n));
+            CHECK(fs.read(name, offset, n) == expect);
+        }
+    }
+    fs.close();
+    fs.open(IMG, DB, small);
+    for (const std::string& name : names) CHECK(fs.read(name, 0, 64 * 4096) == model[name]);
+}
+
+static void sequential_reads_are_prefetched() {
+    filesystem fs;
+    fresh(fs, 64);
+    fs.createFile("/f");
+    fs.write("/f", 0, bytes(48 * 4096, 'a'));
+    fs.close();
+    fs.open(IMG, DB, OPTS);                                // empty cache
+    for (int i = 0; i < 48; i++) CHECK(fs.read("/f", i * 4096, 4096) == bytes(4096, 'a'));
+    fs_stats s = fs.stats();
+    CHECK(s.cache.hits + s.cache.misses == 48);
+    if (OPTS.version == fs_version::baseline) {
+        CHECK(s.cache.prefetchIssued == 0);
+        CHECK(s.cache.misses == 48);
+    } else {
+        CHECK(s.cache.prefetchUsed > 24);
+        CHECK(s.cache.misses < 24);
+    }
+}
+
+static void accesses_are_recorded() {
+    {
+        filesystem fs;
+        fresh(fs);
+        fs.createFile("/f");
+        fs.write("/f", 0, bytes(2 * 4096, 'a'));           // 2 block writes
+        fs.read("/f", 0, 3 * 4096);                        // 2 block reads
+    }
+    sqlite3* db = nullptr;
+    CHECK(sqlite3_open(DB, &db) == SQLITE_OK);
+    sqlite3_stmt* st = nullptr;
+    CHECK(sqlite3_prepare_v2(db, "SELECT COUNT(*), SUM(is_write) FROM access_log", -1, &st, nullptr) == SQLITE_OK);
+    CHECK(sqlite3_step(st) == SQLITE_ROW);
+    CHECK(sqlite3_column_int(st, 0) == 4);
+    CHECK(sqlite3_column_int(st, 1) == 2);
+    sqlite3_finalize(st);
+    sqlite3_close(db);
 }
 
 #define RUN(test)                              \
@@ -246,7 +399,7 @@ static void open_rejects_missing_database() {
         test();                                \
     } while (0)
 
-int main() {
+static void all() {
     RUN(format_creates_empty_root);
     RUN(format_refuses_existing_image);
     RUN(create_file_appears_in_listing);
@@ -265,6 +418,21 @@ int main() {
     RUN(directories_are_not_files);
     RUN(contents_survive_reopen);
     RUN(open_rejects_missing_database);
+    RUN(truncate_shrinks_and_frees_blocks);
+    RUN(truncate_then_grow_reads_zeros);
+    RUN(rename_moves_and_replaces);
+    RUN(rename_rules);
+    RUN(contents_match_a_model_under_cache_pressure);
+    RUN(sequential_reads_are_prefetched);
+    RUN(accesses_are_recorded);
+}
+
+int main() {
+    for (fs_version version : {fs_version::baseline, fs_version::predict, fs_version::adaptive}) {
+        std::cout << "== version " << "ABC"[int(version)] << std::endl;
+        OPTS.version = version;
+        all();
+    }
     cleanup();
     return 0;
 }

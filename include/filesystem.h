@@ -1,5 +1,9 @@
 #pragma once
+#include "block_cache.h"
 #include "block_storage.h"
+#include "lru.h"
+#include "policy.h"
+#include "predictor.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -13,11 +17,35 @@ struct file_info {
     std::uint64_t size;
 };
 
+// The three versions the experiments compare. Each includes the one before it.
+enum class fs_version {
+    baseline,   // A: LRU caches of fixed size
+    predict,    // B: A + access prediction and prefetching with fixed settings
+    adaptive,   // C: B + feedback that tunes prefetching and the cache split
+};
+
+struct fs_options {
+    fs_version version = fs_version::baseline;
+    std::size_t cacheBytes = 4 << 20;   // memory shared by the block cache and the mapping cache
+    io_mode mode = io_mode::buffered;
+};
+
+struct fs_stats {
+    cache_stats cache;
+    std::uint64_t indexHits = 0, indexMisses = 0, indexGhostHits = 0;
+    std::uint64_t dbLookups = 0, dbLookupNanos = 0;   // mapping queries that reached SQLite
+    std::uint64_t memoryBytes = 0;                    // held by both caches right now
+    double threshold = 0, dataShare = 0;              // current policy settings
+    int depth = 0;
+};
+
 // Files and directories on top of block_storage. SQLite holds the metadata
 // (names, sizes, which blocks belong to which file, which blocks are free);
 // the image file holds the data. Paths are absolute and '/'-separated.
 // Failures throw std::system_error carrying an errno value (ENOENT, EEXIST,
 // ENOSPC, ...), so a FUSE adapter can return it directly.
+// Caching and prediction only change speed: every version returns the same
+// bytes. Not thread-safe; call from one thread.
 class filesystem {
 public:
     filesystem() = default;
@@ -26,13 +54,17 @@ public:
     filesystem& operator=(const filesystem&) = delete;
 
     void format(const std::string& imagePath, const std::string& dbPath, std::uint32_t blockCount,
-                io_mode mode = io_mode::buffered);
-    void open(const std::string& imagePath, const std::string& dbPath, io_mode mode = io_mode::buffered);
+                const fs_options& options = {});
+    void open(const std::string& imagePath, const std::string& dbPath, const fs_options& options = {});
     void close();
 
     void createFile(const std::string& path);
     void mkdir(const std::string& path);
     void remove(const std::string& path);   // file or empty directory
+    // Replaces `to` if it exists and is a file or an empty directory of the same kind.
+    void rename(const std::string& from, const std::string& to);
+    // Shrinking frees blocks; growing leaves a hole that reads as zeros.
+    void truncate(const std::string& path, std::uint64_t size);
     std::vector<std::string> list(const std::string& path);
     file_info stat(const std::string& path);
 
@@ -40,9 +72,40 @@ public:
     // Returns fewer than `size` bytes when the range runs past the end of the file.
     std::vector<char> read(const std::string& path, std::uint64_t offset, std::size_t size);
 
+    fs_stats stats();
+
 private:
+    struct access {
+        std::int64_t inode;
+        std::uint64_t idx;
+        bool isWrite;
+    };
+
+    void start(const fs_options& options);
     void create(const std::string& path, bool isDir);
+    void unlink(std::int64_t id, const std::string& path);
+    std::int64_t blockOf(std::int64_t inode, std::uint64_t idx, bool readAhead = false);
+    void remember(std::uint64_t key, std::int64_t block);
+    void forgetMappings();
+    void anticipate(std::int64_t inode, std::uint64_t idx);
+    void adapt();
+    void resize();
+    void record(std::int64_t inode, std::uint64_t idx, bool isWrite);
+    void flushLog();
 
     block_storage storage;
+    block_cache cache{storage};
     sqlite3* db = nullptr;
+    fs_options options;
+
+    // Which block holds (file, index), so most lookups skip SQLite. -1 is a hole.
+    lru<std::uint64_t, std::int64_t> index;
+    lru<std::uint64_t, char> indexGhost;
+    predictor guesser;
+    policy tuning;
+    fs_stats counters;
+    cache_stats lastCache;               // snapshot at the previous adapt()
+    std::uint64_t lastIndexGhostHits = 0;
+    std::uint64_t blockReads = 0;
+    std::vector<access> log;             // not yet written to access_log
 };
