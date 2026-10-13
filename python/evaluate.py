@@ -36,10 +36,11 @@ METRICS = [
     ("memory_kb", "Memory (KiB)", "Memory held by the caches, KiB", True),
     ("index_queries", "Mapping queries", "Block-mapping queries sent to SQLite", True),
     ("index_time_ms", "Mapping time (ms)", "Time spent in block-mapping queries, ms", True),
+    ("model_accuracy", "Model accuracy (C only)", "Share of recent reads the model guessed first", False),
 ]
 CHARTS = ["read_avg_us", "cache_hit_rate", "prefetch_wasted", "disk_reads", "index_time_ms"]
 COLORS = {"A": "#2a78d6", "B": "#eb6834", "C": "#1baf7a"}
-NAMES = {"A": "A: baseline", "B": "B: prediction", "C": "C: adaptive"}
+NAMES = {"A": "A: baseline", "B": "B: prediction", "C": "C: learned model"}
 
 
 def run():

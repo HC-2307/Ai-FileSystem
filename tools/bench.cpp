@@ -98,7 +98,7 @@ int main(int argc, char** argv) {
         std::cout << "version,workload,cache_kb,think_us,seed,ops,throughput_ops_s,read_avg_us,read_p50_us,"
                      "read_p99_us,write_avg_us,cache_hit_rate,prefetch_issued,prefetch_used,prefetch_wasted,"
                      "prediction_precision,prediction_coverage,disk_reads,disk_writes,memory_kb,"
-                     "index_queries,index_time_ms,final_depth,final_threshold,final_data_share\n";
+                     "index_queries,index_time_ms,final_depth,final_threshold,final_data_share,model_updates,model_accuracy\n";
         return 0;
     }
     if (argc < 3) {
@@ -156,7 +156,7 @@ int main(int argc, char** argv) {
         const std::uint64_t lookups = s.cache.hits + s.cache.misses;
         const std::uint64_t settled = s.cache.prefetchUsed + s.cache.prefetchWasted;
 
-        std::printf("%s,%s,%ld,%ld,%u,%zu,%.0f,%.2f,%.2f,%.2f,%.2f,%.4f,%llu,%llu,%llu,%.4f,%.4f,%llu,%llu,%llu,%llu,%.2f,%d,%.2f,%.2f\n",
+        std::printf("%s,%s,%ld,%ld,%u,%zu,%.0f,%.2f,%.2f,%.2f,%.2f,%.4f,%llu,%llu,%llu,%.4f,%.4f,%llu,%llu,%llu,%llu,%.2f,%d,%.2f,%.2f,%llu,%.4f\n",
                     version.c_str(), workload.c_str(), cacheKb, thinkUs, seed, ops.size(),
                     ops.size() / (busyUs / 1e6),   // operations per second of time spent inside the filesystem
                     readAvg, percentile(readUs, 0.5), percentile(readUs, 0.99), writeAvg,
@@ -167,7 +167,8 @@ int main(int argc, char** argv) {
                     lookups ? double(s.cache.prefetchUsed) / lookups : 0.0,   // block lookups served by a prefetch
                     (unsigned long long)s.cache.diskReads, (unsigned long long)s.cache.diskWrites,
                     (unsigned long long)(s.memoryBytes / 1024), (unsigned long long)s.dbLookups,
-                    s.dbLookupNanos / 1e6, s.depth, s.threshold, s.dataShare);
+                    s.dbLookupNanos / 1e6, s.depth, s.threshold, s.dataShare,
+                    (unsigned long long)s.modelUpdates, s.modelAccuracy);
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "ai_fs_bench: " << e.what() << std::endl;
