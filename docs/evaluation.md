@@ -4,19 +4,19 @@ All numbers here were measured on one machine by `python/evaluate.py`. The raw
 rows are in [experiments/results.csv](../experiments/results.csv) and every
 metric is tabulated in [experiments/summary.md](../experiments/summary.md).
 
-Version C is the project: a scikit-learn decision tree, trained on the reads
-while the filesystem runs, that predicts which blocks to prefetch. A (no
-prediction) and B (hand-written prediction) are the comparisons.
+Version C is the project: a scikit-learn decision tree, trained in Python on
+the reads while the filesystem runs and followed by the filesystem to predict
+which blocks to prefetch. A (no prediction) and B (hand-written prediction)
+are the comparisons.
 
 ## Summary
 
 - **The model learns the patterns by itself.** It predicts sequential and repeating reads and predicts nothing on random ones.
-- **It is nearly always right when it predicts a clear pattern.** It wastes no prefetches on the sequential, random and repetitive workloads, where B wastes about 2,050 on random and 169 on repetitive. On the mixed workload it wastes about 390, against B's 1,510.
-- **Against A (no prediction):** C is faster on sequential and repetitive reads in both columns, and on mixed reads when there is think time. With no think time, mixed is the same within noise.
-- **Against B (hand-written), no think time:** C is slower on sequential (163 against 131 us) and about equal on repetitive and mixed.
-- **Against B, with 200 us of think time:** C is faster on repetitive (129 against 156 us) and mixed (288 against 333 us), and slightly slower on sequential (86 against 79 us).
-- **Where C is behind:** it serves fewer reads from prefetch than B whenever reads come faster than the model can answer, and on the mixed workload in both columns (17% to 22% against B's 42%).
-- **Against the earlier rule-based version C:** the model is slower with no think time (see the last section).
+- **No think time:** C has the lowest read latency on every workload: 81 us against B's 121 on sequential, 121 against 193 on repetitive, 212 against 265 on mixed.
+- **With 200 us of think time:** C and B are level on sequential (77 and 80 us). C is behind B on repetitive (175 against 158 us) and mixed (364 against 331 us), though the repetitive runs varied too much to call (146 to 222 us).
+- **Waste:** C wastes no prefetches on the sequential, random and repetitive workloads, where B wastes about 2,050 on random and 169 on repetitive. On mixed C wastes about 410, against B's 1,510.
+- **Where C is behind:** on the mixed workload it serves 24% of reads from prefetch against B's 42%.
+- **Against the earlier rule-based version C:** the model is now faster on repetitive reads and slower on sequential and mixed (see the last section).
 
 ## Setup
 
@@ -52,36 +52,35 @@ Average read latency in microseconds (lower is better):
 
 | Workload | Think 0: A | B | C | Think 200: A | B | C |
 |---|---:|---:|---:|---:|---:|---:|
-| sequential | 176 | 131 | 163 | 408 | 79 | 86 |
-| random | 342 | 293 | 275 | 510 | 501 | 359 |
-| repetitive | 314 | 194 | 202 | 503 | 156 | 129 |
-| mixed | 243 | 257 | 247 | 508 | 333 | 288 |
+| sequential | 158 | 121 | 81 | 435 | 80 | 77 |
+| random | 315 | 300 | 254 | 509 | 487 | 460 |
+| repetitive | 303 | 193 | 121 | 506 | 158 | 175 |
+| mixed | 242 | 265 | 212 | 483 | 331 | 364 |
 
-- **No think time:** the model takes about 100 us per read, so when reads come back to back its answers fall behind and fewer blocks are prefetched in time. That costs most on sequential reads, where B's detector is instant.
-- **With think time:** the model keeps up. It beats B on repetitive and mixed reads and is within 7 us of it on sequential.
-- **Random:** C measures faster than A in both columns, but nothing was prefetched, so the model's predictions cannot be the cause. On this machine a second busy process shortens disk-read times (measured separately: version A alone got about 25% faster while an unrelated program kept one processor busy). Read the random row as "no difference".
+- **No think time:** C is fastest everywhere. It predicts 4 blocks ahead where B predicts 2, so more prefetches finish before the block is asked for, and it loads block mappings 32 at a time.
+- **With think time:** even B's 2 blocks ahead have time to arrive, so that advantage disappears. C is level with B on sequential and behind on mixed, where it predicts fewer reads. On repetitive the three C runs ranged from 146 to 222 us, so the 175 against 158 is not a reliable difference.
+- **Random:** C measures faster than A and B, but nothing was prefetched, so the model's predictions cannot be the cause. Timings on this machine shift with what else is running (version A alone got about 25% faster while an unrelated program kept one processor busy). Read the random row as "no difference".
 - Every version is slower with think time, A included. The reader thread sleeps between requests and pays a wake-up cost on each one; compare versions within a column, not across columns.
 
 ## What the model learned
 
-Share of reads served from a prefetched block:
+Share of reads served from a prefetched block (the two think-time columns agree to within a point):
 
-| Workload | Think 0: B | C | Think 200: B | C |
-|---|---:|---:|---:|---:|
-| sequential | 0.997 | 0.794 | 0.997 | 0.968 |
-| random | 0.011 | 0.000 | 0.011 | 0.000 |
-| repetitive | 0.766 | 0.697 | 0.771 | 0.786 |
-| mixed | 0.421 | 0.167 | 0.424 | 0.217 |
+| Workload | B | C |
+|---|---:|---:|
+| sequential | 0.997 | 0.997 |
+| random | 0.011 | 0.000 |
+| repetitive | 0.766 | 0.814 |
+| mixed | 0.422 | 0.236 |
 
-- **Sequential and repetitive:** given time to answer, the model covers about as many reads as B (more on repetitive). Without it, it covers 70% to 80%.
-- **Repetitive:** the order contains repeated blocks, so some blocks have two possible followers. The tree is told the two jumps before each read and can tell them apart; B's table cannot.
-- **Mixed:** this is the model's weak case in both columns. The pattern changes every 512 operations, and the model only learns a new pattern at its next training (up to 256 reads later) and only after seeing it twice. Its window also holds the random phases, which the tree has to work around.
+- **Sequential:** the same as B.
+- **Repetitive:** better than B. The order contains repeated blocks, so some blocks have two possible followers. The tree is told the two jumps before each read and can tell them apart; B's table cannot.
+- **Mixed:** this is the model's weak case. The pattern changes every 512 operations, and the model only learns a new pattern at its next training (up to 256 reads later) and only after seeing it twice. Its window also holds the random phases, which the tree has to work around.
 - **Random:** it predicts nothing, because no leaf of the tree is pure.
 
-The model's own accuracy figure (share of recent reads that were its first
-guess) ends at 0.99 on sequential and repetitive reads with think time, and
-0.33 on mixed. With no think time it reads lower (0.76, 0.79, 0.28), because a
-read the model had no time to predict counts as a miss.
+The model's accuracy figure (running share of reads that were the tree's first
+guess) ends at 1.00 on sequential and repetitive reads, 0.35 on mixed and 0 on
+random.
 
 ## Cache hit rate and prefetching
 
@@ -92,10 +91,10 @@ With no think time:
 
 | Workload | Hit rate A | B | C | Prefetch precision B | C | Wasted B | C |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| sequential | 0.000 | 0.997 | 0.794 | 1.000 | 1.000 | 0 | 0 |
-| random | 0.056 | 0.054 | 0.056 | 0.043 | none issued | 2,048 | 0 |
-| repetitive | 0.046 | 0.808 | 0.748 | 0.974 | 1.000 | 169 | 0 |
-| mixed | 0.039 | 0.454 | 0.205 | 0.674 | 0.764 | 1,510 | 391 |
+| sequential | 0.000 | 0.997 | 0.997 | 1.000 | 1.000 | 0 | 0 |
+| random | 0.056 | 0.054 | 0.056 | 0.043 | none issued | 2,047 | 0 |
+| repetitive | 0.046 | 0.807 | 0.860 | 0.974 | 1.000 | 169 | 0 |
+| mixed | 0.039 | 0.454 | 0.269 | 0.674 | 0.810 | 1,510 | 406 |
 
 Precision is the share of prefetched blocks that were read before being
 evicted. A's hit rate is near zero on purpose: the cache is far smaller than
@@ -103,7 +102,7 @@ the data and none of these workloads revisits a block soon enough for LRU.
 
 B prefetches on any block it has seen once before. The model only predicts
 from a pure leaf, so on a steady pattern it is always right. On the mixed
-workload it is wrong about a quarter of the time: a tree trained on one phase
+workload it is wrong about a fifth of the time: a tree trained on one phase
 keeps predicting into the next.
 
 ## Disk I/O
@@ -114,12 +113,12 @@ keeps predicting into the next.
 |---|---:|---:|---:|
 | sequential | 8,192 | 8,192 | 8,192 |
 | random | 7,735 | 9,919 | 7,735 |
-| repetitive | 7,815 | 7,988 | 7,814 |
-| mixed | 7,100 | 9,060 | 7,650 |
+| repetitive | 7,815 | 7,988 | 7,817 |
+| mixed | 7,100 | 9,059 | 7,714 |
 
 Prefetching does not reduce the number of blocks read; it moves reads off the
 request path, and wrong guesses add reads. B adds 28% on random and mixed. C
-adds none on random and 8% on mixed.
+adds none on random and 9% on mixed.
 
 ## Metadata indexing overhead
 
@@ -129,20 +128,20 @@ Total time in block-mapping queries, milliseconds, no think time:
 
 | Workload | A | B | C |
 |---|---:|---:|---:|
-| sequential | 115 | 183 | 17 |
-| random | 133 | 130 | 84 |
-| repetitive | 13 | 12 | 9 |
-| mixed | 80 | 115 | 69 |
+| sequential | 106 | 172 | 9 |
+| random | 116 | 134 | 80 |
+| repetitive | 12 | 13 | 10 |
+| mixed | 83 | 121 | 60 |
 
 - B is worse than A on sequential and mixed: looking up the mapping of each predicted block one at a time adds queries.
-- When C looks up a predicted block it loads the next 32 mappings in the same query. That cuts sequential mapping queries from 8,192 to about 725. This is not machine learning; it is a fixed part of how C looks up what the model predicts.
+- When C looks up a predicted block it loads the next 32 mappings in the same query. That cuts sequential mapping queries from 8,192 to about 290. This is not machine learning; it is a fixed part of how C looks up what the model predicts, and it is part of why C's sequential latency is low.
 - C's lower time on random is the same machine effect as in the latency table: it ran the same 5,313 queries as A.
 
 ## Memory and writes
 
 - The caches stay inside the 1024 KiB budget in every version (954 to 1,022 KiB in use at the end of each run).
-- The model is outside that budget: the 2,048 reads it remembers, the tree, and the Python process itself.
-- Write latency (mixed workload only) is 250 / 242 / 231 us for A / B / C with no think time. Writes are full-block overwrites and go straight to the image in every version.
+- The model is outside that budget: the 2,048 reads it remembers and the Python process, plus the copy of the tree the filesystem holds.
+- Write latency (mixed workload only) is 260 / 253 / 203 us for A / B / C with no think time. Writes are full-block overwrites and go straight to the image in every version.
 
 ## Model against the earlier rule-based version C
 
@@ -152,14 +151,32 @@ were removed and replaced by the model. Their last measured results (commit
 
 | Workload | Read latency: rules | model | Reads served by prefetch: rules | model | Wasted prefetches: rules | model |
 |---|---:|---:|---:|---:|---:|---:|
-| sequential | 64 | 163 | 0.997 | 0.794 | 0 | 0 |
-| random | 293 | 275 | 0 | 0 | 0 | 0 |
-| repetitive | 139 | 202 | 0.792 | 0.697 | 1,067 | 0 |
-| mixed | 197 | 247 | 0.508 | 0.167 | 188 | 391 |
+| sequential | 64 | 81 | 0.997 | 0.997 | 0 | 0 |
+| random | 293 | 254 | 0 | 0 | 0 | 0 |
+| repetitive | 139 | 121 | 0.792 | 0.814 | 1,067 | 0 |
+| mixed | 197 | 212 | 0.508 | 0.236 | 188 | 406 |
 
-- The rule-based version was faster on sequential, repetitive and mixed reads. Its rules ran inside the filesystem with no delay and prefetched up to 8 blocks ahead; the model runs in another process, answers late, and looks 4 ahead.
-- The model wastes fewer prefetches on the repetitive workload and more on the mixed one.
-- The two sets of numbers come from runs on different days, and timings on this machine drift by tens of microseconds between runs (A's sequential latency was 162 then and 176 now). The size of the gaps is approximate; their direction on sequential, repetitive and mixed is not in doubt.
+- **Repetitive:** the model is faster, predicts more and wastes nothing.
+- **Sequential:** the rules were faster. They prefetched up to 8 blocks ahead; the model looks 4 ahead.
+- **Mixed:** the rules were faster and predicted about twice as many reads. They reacted to a new pattern within a few reads; the model waits for its next training.
+- The two sets of numbers come from runs on different days, and timings on this machine drift by tens of microseconds between runs. The size of the gaps is approximate.
+
+## Earlier designs of the model
+
+Three designs were measured before this one. Each kept all prediction in
+Python, with the filesystem sending a read and using the answer when it
+arrived. Average read latency, no think time:
+
+| Workload | Neural network in Python | Decision tree in Python | Decision tree, followed in C++ (now) |
+|---|---:|---:|---:|
+| sequential | 141 | 163 | 81 |
+| repetitive | 192 | 202 | 121 |
+| mixed | 240 | 247 | 212 |
+
+A Python program takes about 100 us to answer one read, longer than a cached
+read takes, so its answers always arrived late. Having Python train the tree
+and the filesystem follow it removed that delay. (Waiting for Python's answer
+on every read was tried first and was slower than no prediction at all.)
 
 ## Limits of this evaluation
 
