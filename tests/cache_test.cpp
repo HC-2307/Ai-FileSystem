@@ -1,6 +1,5 @@
 #include "block_cache.h"
 #include "check.h"
-#include "policy.h"
 #include "predictor.h"
 
 #include <cstdio>
@@ -112,46 +111,6 @@ static void predictor_learns_a_repeating_order() {
     CHECK(next[0].confidence >= 0.5);
 }
 
-static void predictor_goes_quiet_when_it_keeps_missing() {
-    predictor fixed, calibrated;
-    calibrated.calibrate = true;
-    std::uint32_t x = 12345;
-    double loud = 0, quiet = 0;
-    for (int i = 0; i < 4000; i++) {
-        x = x * 1664525u + 1013904223u;     // revisits blocks, but in no repeating order
-        const std::uint64_t idx = (x >> 16) % 200;
-        for (const prediction& g : fixed.observe(1, idx, 1)) loud += g.confidence >= 0.5;
-        for (const prediction& g : calibrated.observe(1, idx, 1)) quiet += g.confidence >= 0.5;
-    }
-    CHECK(loud > 100);
-    CHECK(quiet < loud / 10);
-    CHECK(calibrated.tableAccuracy() < 0.2);
-}
-
-static void policy_follows_prefetch_outcomes() {
-    policy p;
-    p.learn(16, 0);
-    CHECK(p.depth == 3 && p.threshold < 0.5);
-    for (int i = 0; i < 20; i++) p.learn(0, 16);
-    CHECK(p.depth == 1 && p.threshold > 0.85);
-    p.learn(8, 8);                          // in between: leave it alone
-    CHECK(p.depth == 1);
-}
-
-static void policy_moves_memory_to_the_cache_that_needs_it() {
-    policy p;
-    p.rebalance(1, 10, 100000, 20000, 100, 100, 50);   // index misses cost more in total
-    CHECK(p.dataShare < 0.9);
-    const double before = p.dataShare;
-    p.rebalance(0, 10, 100000, 20000, 80, 100, 50);    // an index with room to spare gets no more
-    p.rebalance(0, 0, 100000, 20000, 100, 100, 50);    // nothing observed, nothing moved
-    CHECK(p.dataShare == before);
-    p.rebalance(1, 0, 100000, 20000, 40, 100, 50);     // unused index room goes back to data
-    CHECK(p.dataShare > before);
-    for (int i = 0; i < 40; i++) p.rebalance(10, 0, 100000, 20000, 100, 100, 50);
-    CHECK(p.dataShare > 0.94 && p.dataShare <= 0.95);
-}
-
 #define RUN(test)                              \
     do {                                       \
         std::cout << #test << std::endl;       \
@@ -165,8 +124,5 @@ int main() {
     RUN(prefetch_never_brings_back_old_data);
     RUN(predictor_follows_a_sequential_scan);
     RUN(predictor_learns_a_repeating_order);
-    RUN(predictor_goes_quiet_when_it_keeps_missing);
-    RUN(policy_follows_prefetch_outcomes);
-    RUN(policy_moves_memory_to_the_cache_that_needs_it);
     return 0;
 }

@@ -38,8 +38,6 @@ const std::pair<const std::uint64_t, std::uint32_t>* predictor::likeliest(std::u
 std::vector<prediction> predictor::observe(std::int64_t inode, std::uint64_t idx, int depth) {
     const std::uint64_t key = blockKey(inode, idx);
     std::vector<prediction> out;
-    // An untested model counts in full; one that is wrong most of the time fades out.
-    auto weight = [&](int model) { return calibrate ? std::min(1.0, 2 * accuracy[model]) : 1.0; };
 
     auto found = streams.try_emplace(inode, stream{idx, 0, 0});
     stream& s = found.first->second;
@@ -51,7 +49,7 @@ std::vector<prediction> predictor::observe(std::int64_t inode, std::uint64_t idx
         s.last = idx;
     }
     if (s.streak > 0) {
-        const double confidence = s.streak / (s.streak + 1.0) * weight(STRIDE);
+        const double confidence = s.streak / (s.streak + 1.0);
         for (int k = 1; k <= depth; k++) {
             const std::int64_t next = std::int64_t(idx) + s.delta * k;
             if (next < 0 || next > 0xffffffffLL) break;
@@ -71,7 +69,7 @@ std::vector<prediction> predictor::observe(std::int64_t inode, std::uint64_t idx
     hasLast = true;
     lastKey = key;
 
-    double confidence = weight(TABLE), share = 0;
+    double confidence = 1, share = 0;
     const auto* first = likeliest(key, share);
     guessed = first != nullptr;
     if (first) guess = first->first;

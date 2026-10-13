@@ -145,7 +145,7 @@ int usage() {
     std::cerr << "usage: ai_fs format <image> <db> <blocks>\n"
                  "       ai_fs mount <image> <db> <mountpoint> [--version A|B|C] [--cache-mb N] [--direct]"
                  " [FUSE options]\n"
-                 "  A: plain LRU caches   B: adds prediction and prefetching   C: adds feedback (default)\n"
+                 "  A: plain LRU caches   B: hand-written prediction   C: machine-learning model in Python (default)\n"
                  "  --direct opens the image with O_DIRECT (not available on tmpfs)\n";
     return 2;
 }

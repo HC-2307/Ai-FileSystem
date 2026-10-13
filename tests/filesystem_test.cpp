@@ -7,6 +7,7 @@
 #include <iostream>
 #include <map>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -374,6 +375,100 @@ static void sequential_reads_are_prefetched() {
     }
 }
 
+static void model_runs_only_in_version_c() {
+    filesystem fs;
+    fresh(fs, 64);
+    fs.createFile("/f");
+    fs.write("/f", 0, bytes(48 * 4096, 'a'));
+    fs.close();
+    fs.open(IMG, DB, OPTS);
+    for (int i = 0; i < 48; i++) fs.read("/f", i * 4096, 4096);
+    const fs_stats s = fs.stats();
+    if (OPTS.version == fs_version::adaptive) {
+        CHECK(s.modelUpdates == 48);
+        CHECK(s.modelAccuracy > 0.15);
+    } else {
+        CHECK(s.modelUpdates == 0 && s.modelAccuracy == 0);
+    }
+}
+
+// The model predicts blocks past the end of a file, and of a file that is then deleted.
+static void predictions_for_missing_blocks_are_ignored() {
+    filesystem fs;
+    fresh(fs, 64);
+    fs.createFile("/f");
+    fs.write("/f", 0, bytes(48 * 4096, 'a'));
+    fs.createFile("/g");
+    fs.write("/g", 0, bytes(4096, 'g'));
+    for (int i = 0; i < 48; i++) CHECK(fs.read("/f", i * 4096, 4096) == bytes(4096, 'a'));
+    fs.remove("/f");
+    CHECK(fs.read("/g", 0, 4096) == bytes(4096, 'g'));
+    CHECK(fs.read("/g", 4096, 4096).empty());
+}
+
+static void random_reads_are_not_prefetched_by_the_model() {
+    if (OPTS.version != fs_version::adaptive) return;
+    fs_options o = OPTS;
+    o.cacheBytes = 64 * 4096;
+    cleanup();
+    filesystem fs;
+    fs.format(IMG, DB, 2100, o);
+    fs.createFile("/f");
+    fs.write("/f", 0, bytes(2000 * 4096, 'a'));
+    fs.close();
+    fs.open(IMG, DB, o);
+    std::uint32_t x = 12345;
+    for (int i = 0; i < 4000; i++) {
+        x = x * 1664525u + 1013904223u;
+        fs.read("/f", std::uint64_t((x >> 16) % 2000) * 4096, 4096);
+    }
+    CHECK(fs.stats().cache.prefetchIssued < 40);
+}
+
+static void model_learns_recorded_history_at_open() {
+    fs_options recorder = OPTS;
+    recorder.version = fs_version::baseline;
+    cleanup();
+    {
+        filesystem fs;
+        fs.format(IMG, DB, 64, recorder);
+        fs.createFile("/f");
+        fs.write("/f", 0, bytes(48 * 4096, 'a'));
+        for (int i = 0; i < 48; i++) fs.read("/f", i * 4096, 4096);
+    }
+    filesystem fs;
+    fs.open(IMG, DB, OPTS);
+    const fs_stats s = fs.stats();
+    CHECK(s.modelUpdates == (OPTS.version == fs_version::adaptive ? 48u : 0u));
+    CHECK(s.cache.prefetchIssued == 0);     // replaying history must not touch the disk
+}
+
+static void a_model_that_cannot_start_is_reported() {
+    if (OPTS.version != fs_version::adaptive) return;
+    { filesystem fs; fresh(fs); }
+    fs_options broken = OPTS;
+    broken.modelCommand = "exit 3";
+    filesystem fs;
+    CHECK_THROWS(fs.open(IMG, DB, broken), std::runtime_error);
+    fs.open(IMG, DB, OPTS);                 // and the filesystem object is still usable
+    CHECK(fs.list("/").empty());
+}
+
+static void reads_still_work_when_the_model_dies() {
+    if (OPTS.version != fs_version::adaptive) return;
+    fs_options dying = OPTS;
+    dying.modelCommand = "echo ready; read line; exit 0";   // answers nothing, then goes away
+    dying.modelWaitMs = 0;
+    cleanup();
+    filesystem fs;
+    fs.format(IMG, DB, 64, dying);
+    fs.createFile("/f");
+    fs.write("/f", 0, bytes(16 * 4096, 'a'));
+    for (int i = 0; i < 16; i++) CHECK(fs.read("/f", i * 4096, 4096) == bytes(4096, 'a'));
+    const fs_stats s = fs.stats();
+    CHECK(s.cache.prefetchIssued == 0 && s.modelUpdates == 0);
+}
+
 static void accesses_are_recorded() {
     {
         filesystem fs;
@@ -424,10 +519,17 @@ static void all() {
     RUN(rename_rules);
     RUN(contents_match_a_model_under_cache_pressure);
     RUN(sequential_reads_are_prefetched);
+    RUN(model_runs_only_in_version_c);
+    RUN(predictions_for_missing_blocks_are_ignored);
+    RUN(random_reads_are_not_prefetched_by_the_model);
+    RUN(model_learns_recorded_history_at_open);
+    RUN(a_model_that_cannot_start_is_reported);
+    RUN(reads_still_work_when_the_model_dies);
     RUN(accesses_are_recorded);
 }
 
 int main() {
+    OPTS.modelWaitMs = 5000;   // wait for the model on every read, so the tests do not depend on timing
     for (fs_version version : {fs_version::baseline, fs_version::predict, fs_version::adaptive}) {
         std::cout << "== version " << "ABC"[int(version)] << std::endl;
         OPTS.version = version;

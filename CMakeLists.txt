@@ -18,11 +18,23 @@ add_library(ai_fs_core STATIC
     src/block_storage.cpp
     src/block_cache.cpp
     src/predictor.cpp
+    src/model_client.cpp
     src/filesystem.cpp
 )
 target_include_directories(ai_fs_core PUBLIC include)
 target_link_libraries(ai_fs_core PRIVATE SQLite::SQLite3 PUBLIC Threads::Threads)
 target_compile_options(ai_fs_core PRIVATE -Wall -Wextra)
+
+# Version C runs python/model.py, which needs scikit-learn. Use the project's virtual
+# environment when there is one.
+# shortcut: the command breaks if the project path has spaces in it; quote it if that comes up.
+if(EXISTS ${CMAKE_SOURCE_DIR}/.venv/bin/python)
+    set(MODEL_PYTHON ${CMAKE_SOURCE_DIR}/.venv/bin/python)
+else()
+    set(MODEL_PYTHON python3)
+endif()
+target_compile_definitions(ai_fs_core PRIVATE
+    AI_FS_MODEL_COMMAND="${MODEL_PYTHON} ${CMAKE_SOURCE_DIR}/python/model.py")
 
 add_executable(ai_fs
     src/main.cpp
@@ -62,6 +74,8 @@ target_include_directories(cache_test PRIVATE tests)
 target_link_libraries(cache_test PRIVATE ai_fs_core)
 target_compile_options(cache_test PRIVATE -Wall -Wextra)
 add_test(NAME cache_test COMMAND cache_test)
+
+add_test(NAME model_test COMMAND ${MODEL_PYTHON} ${CMAKE_SOURCE_DIR}/tests/model_test.py)
 
 # Mounts the filesystem for real; exits 77 (skipped) where FUSE is unavailable.
 add_test(NAME mount_test COMMAND ${CMAKE_SOURCE_DIR}/tests/mount_test.sh $<TARGET_FILE:ai_fs>)

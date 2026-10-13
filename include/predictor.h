@@ -15,16 +15,12 @@ struct prediction {
     double confidence;   // 0 to 1
 };
 
-// Guesses which blocks will be read next from the reads seen so far. Two
-// models vote: a stride detector per file (catches sequential and fixed-step
+// Version B's predictor: hand-written, no machine learning. Guesses which
+// blocks will be read next from the reads seen so far. Two detectors vote: a stride detector per file (catches sequential and fixed-step
 // scans the first time they happen) and a table of which block followed which
 // (catches any order that repeats).
 class predictor {
 public:
-    // When set, each model's confidence is scaled by how often its guesses
-    // have turned out right, so a model that keeps missing goes quiet.
-    bool calibrate = false;
-
     // Records a read and returns up to `depth` blocks per model that are
     // likely to follow it, without duplicates.
     std::vector<prediction> observe(std::int64_t inode, std::uint64_t idx, int depth);

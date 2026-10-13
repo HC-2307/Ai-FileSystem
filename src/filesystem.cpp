@@ -18,9 +18,12 @@ const std::uint64_t MAX_FILE_BYTES = BS << 32;   // block indexes are 32-bit
 const std::size_t INDEX_ENTRY_BYTES = 64;        // key, block number, list links and hash node
 const unsigned PREFETCH_THREADS = 4;
 const std::size_t LOG_BATCH = 4096;
-const std::uint64_t ADAPT_EVERY = 256;           // block reads between policy updates
 const int READ_AHEAD_MAPPINGS = 32;
-const int WARM_UP_READS = 50000;
+const int WARM_UP_READS = 50000;                 // recorded reads version B's detectors are shown at start
+const int MODEL_WARM_UP_READS = 8192;            // and how many the model is; it takes longer per read
+const double DATA_SHARE = 0.9;                   // part of the cache memory for block data; the rest caches mappings
+const int PREFETCH_DEPTH = 2;                    // version B: blocks to predict ahead
+const double PREFETCH_THRESHOLD = 0.5;           // version B: confidence needed to prefetch
 
 const char* SCHEMA =
     "CREATE TABLE inodes ("
@@ -193,29 +196,32 @@ void filesystem::open(const std::string& imagePath, const std::string& dbPath, c
 void filesystem::start(const fs_options& chosen) {
     options = chosen;
     exec(db, LOG_SCHEMA);
-    tuning = policy{};
     guesser = predictor{};
-    guesser.calibrate = options.version == fs_version::adaptive;
     counters = fs_stats{};
-    lastCache = cache_stats{};
-    lastIndexGhostHits = blockReads = 0;
     cache.start(1, options.version == fs_version::baseline ? 0 : PREFETCH_THREADS);
     resize();
     if (options.version == fs_version::baseline) return;
+    const bool learned = options.version == fs_version::adaptive;
+    if (learned) model.start(options.modelCommand.empty() ? AI_FS_MODEL_COMMAND : options.modelCommand);
 
-    // Teach the predictor the reads recorded by earlier sessions.
+    // Show the reads recorded by earlier sessions to whatever does the predicting.
     statement past(db,
                    "SELECT inode, idx FROM (SELECT seq, inode, idx FROM access_log WHERE is_write = 0"
                    " ORDER BY seq DESC LIMIT ?) ORDER BY seq");
-    past.bindInt(1, WARM_UP_READS);
-    while (past.step()) guesser.observe(past.integer(0), std::uint64_t(past.integer(1)), 0);
+    past.bindInt(1, learned ? MODEL_WARM_UP_READS : WARM_UP_READS);
+    while (past.step()) {
+        const std::int64_t inode = past.integer(0);
+        const std::uint64_t idx = std::uint64_t(past.integer(1));
+        if (learned) model.learn(inode, idx);
+        else guesser.observe(inode, idx, 0);
+    }
 }
 
 void filesystem::close() {
     if (db) flushLog();
+    model.stop();
     cache.stop();
     index.clear();
-    indexGhost.clear();
     sqlite3_close(db);   // no-op on nullptr
     db = nullptr;
     storage.close();
@@ -413,7 +419,6 @@ std::vector<char> filesystem::read(const std::string& path, std::uint64_t offset
             std::copy_n(buf.begin() + in, len, out.begin() + (pos - offset));
         }
         if (options.version != fs_version::baseline) anticipate(n.id, idx);
-        if (options.version == fs_version::adaptive && ++blockReads % ADAPT_EVERY == 0) adapt();
         pos += len;
     }
     return out;
@@ -423,9 +428,10 @@ fs_stats filesystem::stats() {
     fs_stats s = counters;
     s.cache = cache.stats();
     s.memoryBytes = cache.size() * BS + index.size() * INDEX_ENTRY_BYTES;
-    s.threshold = tuning.threshold;
-    s.depth = tuning.depth;
-    s.dataShare = tuning.dataShare;
+    s.threshold = PREFETCH_THRESHOLD;
+    s.depth = PREFETCH_DEPTH;
+    s.dataShare = DATA_SHARE;
+    model.stats(s.modelUpdates, s.modelAccuracy);
     return s;
 }
 
@@ -438,7 +444,6 @@ std::int64_t filesystem::blockOf(std::int64_t inode, std::uint64_t idx, bool rea
         return *known;
     }
     counters.indexMisses++;
-    if (indexGhost.contains(key)) counters.indexGhostHits++;
 
     auto begin = std::chrono::steady_clock::now();
     std::vector<std::int64_t> found(readAhead ? READ_AHEAD_MAPPINGS : 1, -1);
@@ -453,51 +458,32 @@ std::int64_t filesystem::blockOf(std::int64_t inode, std::uint64_t idx, bool rea
 }
 
 void filesystem::remember(std::uint64_t key, std::int64_t block) {
-    indexGhost.erase(key);
-    for (const auto& dropped : index.put(key, block)) indexGhost.put(dropped.first, 0);
+    index.put(key, block);
 }
 
 // shortcut: drops every cached mapping, not only the affected file's; fine
 // while deletes and truncates are rare, key the cache per file if they are not.
 void filesystem::forgetMappings() {
     index.clear();
-    indexGhost.clear();
 }
 
-// Feeds the read to the predictor and prefetches what it is confident about.
+// Prefetches the blocks expected after this read. Version B asks its two
+// detectors and keeps the confident guesses. Version C tells the model about
+// the read and follows the newest tree the model has trained.
 void filesystem::anticipate(std::int64_t inode, std::uint64_t idx) {
-    const bool adaptive = options.version == fs_version::adaptive;
-    for (const prediction& p : guesser.observe(inode, idx, tuning.depth)) {
-        if (p.confidence < tuning.threshold) continue;
-        std::int64_t block = blockOf(p.inode, p.idx, adaptive);
+    const bool learned = options.version == fs_version::adaptive;
+    for (const prediction& p : learned ? model.ask(inode, idx, options.modelWaitMs) : guesser.observe(inode, idx, PREFETCH_DEPTH)) {
+        if (p.confidence < PREFETCH_THRESHOLD) continue;
+        std::int64_t block = blockOf(p.inode, p.idx, learned);
         if (block >= 0) cache.prefetch(std::uint32_t(block));
     }
 }
 
-// Feedback step: looks at what happened since the last call and retunes.
-void filesystem::adapt() {
-    const cache_stats now = cache.stats();
-    tuning.learn(now.prefetchUsed - lastCache.prefetchUsed, now.prefetchWasted - lastCache.prefetchWasted);
-    tuning.rebalance(now.ghostHits - lastCache.ghostHits, counters.indexGhostHits - lastIndexGhostHits,
-                     now.diskReads ? double(now.diskReadNanos) / now.diskReads : 0,
-                     counters.dbLookups ? double(counters.dbLookupNanos) / counters.dbLookups : 0,
-                     index.size(), index.capacity(), indexGhost.capacity());
-    lastCache = now;
-    lastIndexGhostHits = counters.indexGhostHits;
-    resize();
-}
-
-// Splits the memory budget between the two caches as the policy says.
+// Splits the memory budget between the two caches.
 void filesystem::resize() {
     const double bytes = double(options.cacheBytes);
-    auto blocksIn = [&](double share) { return std::max<std::size_t>(1, std::size_t(bytes * share / BS)); };
-    auto entriesIn = [&](double share) {
-        return std::max<std::size_t>(1, std::size_t(bytes * share / INDEX_ENTRY_BYTES));
-    };
-    cache.setCapacity(blocksIn(tuning.dataShare));
-    cache.setGhostCapacity(blocksIn(policy::STEP));
-    indexGhost.setCapacity(entriesIn(policy::STEP));
-    for (const auto& dropped : index.setCapacity(entriesIn(1 - tuning.dataShare))) indexGhost.put(dropped.first, 0);
+    cache.setCapacity(std::max<std::size_t>(1, std::size_t(bytes * DATA_SHARE / BS)));
+    index.setCapacity(std::max<std::size_t>(1, std::size_t(bytes * (1 - DATA_SHARE) / INDEX_ENTRY_BYTES)));
 }
 
 void filesystem::record(std::int64_t inode, std::uint64_t idx, bool isWrite) {

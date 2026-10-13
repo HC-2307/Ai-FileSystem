@@ -2,7 +2,7 @@
 #include "block_cache.h"
 #include "block_storage.h"
 #include "lru.h"
-#include "policy.h"
+#include "model_client.h"
 #include "predictor.h"
 
 #include <cstddef>
@@ -17,26 +17,31 @@ struct file_info {
     std::uint64_t size;
 };
 
-// The three versions the experiments compare. Each includes the one before it.
+// The three versions the experiments compare. A and B are the comparisons;
+// C is the project.
 enum class fs_version {
-    baseline,   // A: LRU caches of fixed size
-    predict,    // B: A + access prediction and prefetching with fixed settings
-    adaptive,   // C: B + feedback that tunes prefetching and the cache split
+    baseline,   // A: LRU caches, no prefetching
+    predict,    // B: A + prefetching from two hand-written detectors (predictor.h)
+    adaptive,   // C: A + prefetching from a machine-learning model trained on the reads (python/model.py)
 };
 
 struct fs_options {
     fs_version version = fs_version::baseline;
     std::size_t cacheBytes = 4 << 20;   // memory shared by the block cache and the mapping cache
     io_mode mode = io_mode::buffered;
+    std::string modelCommand;           // version C: how to start the model; empty means python/model.py
+    int modelWaitMs = 0;                // version C: how long a read waits for the model to take it in; 0 means not at all
 };
 
 struct fs_stats {
     cache_stats cache;
-    std::uint64_t indexHits = 0, indexMisses = 0, indexGhostHits = 0;
+    std::uint64_t indexHits = 0, indexMisses = 0;
     std::uint64_t dbLookups = 0, dbLookupNanos = 0;   // mapping queries that reached SQLite
     std::uint64_t memoryBytes = 0;                    // held by both caches right now
-    double threshold = 0, dataShare = 0;              // current policy settings
+    double threshold = 0, dataShare = 0;              // version B's fixed settings and the cache split
     int depth = 0;
+    std::uint64_t modelUpdates = 0;                   // version C: reads the model has been shown
+    double modelAccuracy = 0;                         // version C: running share of reads that were its first guess
 };
 
 // Files and directories on top of block_storage. SQLite holds the metadata
@@ -88,7 +93,6 @@ private:
     void remember(std::uint64_t key, std::int64_t block);
     void forgetMappings();
     void anticipate(std::int64_t inode, std::uint64_t idx);
-    void adapt();
     void resize();
     void record(std::int64_t inode, std::uint64_t idx, bool isWrite);
     void flushLog();
@@ -100,12 +104,8 @@ private:
 
     // Which block holds (file, index), so most lookups skip SQLite. -1 is a hole.
     lru<std::uint64_t, std::int64_t> index;
-    lru<std::uint64_t, char> indexGhost;
-    predictor guesser;
-    policy tuning;
+    predictor guesser;                   // version B only
+    model_client model;                  // version C only
     fs_stats counters;
-    cache_stats lastCache;               // snapshot at the previous adapt()
-    std::uint64_t lastIndexGhostHits = 0;
-    std::uint64_t blockReads = 0;
     std::vector<access> log;             // not yet written to access_log
 };
