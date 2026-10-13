@@ -469,6 +469,69 @@ static void reads_still_work_when_the_model_dies() {
     CHECK(s.cache.prefetchIssued == 0 && s.modelUpdates == 0);
 }
 
+// Random reads of more data than either cache holds, so both caches miss.
+static fs_stats afterCachePressure(const fs_options& o) {
+    cleanup();
+    filesystem fs;
+    fs.format(IMG, DB, 600, o);
+    for (const char* name : {"/a", "/b", "/c", "/d"}) {
+        fs.createFile(name);
+        fs.write(name, 0, bytes(128 * 4096, 'a'));
+    }
+    const char* names[] = {"/a", "/b", "/c", "/d"};
+    std::uint32_t x = 99;
+    for (int i = 0; i < 2000; i++) {
+        x = x * 1664525u + 1013904223u;
+        CHECK(fs.read(names[(x >> 8) % 4], std::uint64_t((x >> 16) % 128) * 4096, 4096) == bytes(4096, 'a'));
+    }
+    return fs.stats();
+}
+
+static void memory_split_is_learned_only_in_version_c() {
+    fs_options o = OPTS;
+    o.cacheBytes = 64 * 4096;
+    const fs_stats s = afterCachePressure(o);
+    if (OPTS.version == fs_version::adaptive) {
+        CHECK(s.splitReports == 2000 / 128);
+        CHECK(s.dataShare >= 0.5 - 1e-9 && s.dataShare <= 0.95 + 1e-9);
+        CHECK(s.dataShare != 0.9);                  // the first moves are tries, so it has moved
+        CHECK(s.cache.ghostHits + s.indexGhostHits > 0);
+    } else {
+        CHECK(s.splitReports == 0 && s.dataShare == 0.9 && s.indexGhostHits == 0);
+    }
+
+    // What the reviews found is kept, and shown to the model at the next open.
+    sqlite3* db = nullptr;
+    CHECK(sqlite3_open(DB, &db) == SQLITE_OK);
+    sqlite3_stmt* st = nullptr;
+    CHECK(sqlite3_prepare_v2(db, "SELECT COUNT(*), MIN(share), MAX(share), MIN(read_time) FROM policy_log", -1, &st, nullptr) == SQLITE_OK);
+    CHECK(sqlite3_step(st) == SQLITE_ROW);
+    if (OPTS.version == fs_version::adaptive) {
+        CHECK(sqlite3_column_int(st, 0) == 2000 / 128);
+        CHECK(sqlite3_column_double(st, 1) >= 0.5 - 1e-9 && sqlite3_column_double(st, 2) <= 0.95 + 1e-9);
+        CHECK(sqlite3_column_double(st, 3) > 0);
+    } else {
+        CHECK(sqlite3_column_int(st, 0) == 0);
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    filesystem again;
+    again.open(IMG, DB, OPTS);
+    CHECK(again.read("/a", 0, 4096) == bytes(4096, 'a'));
+}
+
+static void a_bad_memory_split_from_the_model_is_ignored() {
+    if (OPTS.version != fs_version::adaptive) return;
+    fs_options o = OPTS;
+    o.cacheBytes = 64 * 4096;
+    o.modelWaitMs = 0;
+    // A stand-in for the model that answers every line with a split no cache could use.
+    o.modelCommand = "echo ready; while read line; do echo 'M 7.5'; echo 'M nan'; echo 'M -1'; done";
+    const fs_stats s = afterCachePressure(o);
+    CHECK(s.splitReports == 2000 / 128);
+    CHECK(s.dataShare == 0.9);
+}
+
 static void accesses_are_recorded() {
     {
         filesystem fs;
@@ -525,6 +588,8 @@ static void all() {
     RUN(model_learns_recorded_history_at_open);
     RUN(a_model_that_cannot_start_is_reported);
     RUN(reads_still_work_when_the_model_dies);
+    RUN(memory_split_is_learned_only_in_version_c);
+    RUN(a_bad_memory_split_from_the_model_is_ignored);
     RUN(accesses_are_recorded);
 }
 

@@ -21,7 +21,11 @@ const std::size_t LOG_BATCH = 4096;
 const int READ_AHEAD_MAPPINGS = 32;
 const int WARM_UP_READS = 50000;                 // recorded reads version B's detectors are shown at start
 const int MODEL_WARM_UP_READS = 8192;            // and how many the model is; it takes longer per read
-const double DATA_SHARE = 0.9;                   // part of the cache memory for block data; the rest caches mappings
+const double DATA_SHARE = 0.9;                   // part of the cache memory for block data; the rest caches mappings.
+                                                 // Fixed in versions A and B; where version C starts
+const double GHOST_SHARE = 0.05;                 // each cache remembers what this much more memory would still hold
+const std::uint64_t STRETCH = 128;               // version C: block reads between reviews of the memory split
+const int PAST_STRETCHES = 512;                  // recorded reviews shown to the model at start
 const int PREFETCH_DEPTH = 2;                    // version B: blocks to predict ahead
 const double PREFETCH_THRESHOLD = 0.5;           // version B: confidence needed to prefetch
 
@@ -40,7 +44,11 @@ const char* SCHEMA =
 const char* LOG_SCHEMA =
     "CREATE TABLE IF NOT EXISTS access_log ("
     "  seq INTEGER PRIMARY KEY, inode INTEGER NOT NULL, idx INTEGER NOT NULL,"
-    "  is_write INTEGER NOT NULL)";
+    "  is_write INTEGER NOT NULL);"
+    // What version C's reviews of the memory split found: the feedback its model learns from.
+    "CREATE TABLE IF NOT EXISTS policy_log ("
+    "  seq INTEGER PRIMARY KEY, share REAL NOT NULL, data_cost REAL NOT NULL,"
+    "  mapping_cost REAL NOT NULL, read_time REAL NOT NULL)";
 
 [[noreturn]] void fail(int code, const std::string& what) {
     throw std::system_error(code, std::generic_category(), what);
@@ -67,6 +75,10 @@ public:
         sqlite3_bind_int64(st, i, v);
         return *this;
     }
+    statement& bindReal(int i, double v) {
+        sqlite3_bind_double(st, i, v);
+        return *this;
+    }
     statement& bindText(int i, const std::string& v) {
         sqlite3_bind_text(st, i, v.c_str(), -1, SQLITE_TRANSIENT);
         return *this;
@@ -80,6 +92,7 @@ public:
     }
     void reset() { sqlite3_reset(st); }
     std::int64_t integer(int col) { return sqlite3_column_int64(st, col); }
+    double real(int col) { return sqlite3_column_double(st, col); }
     std::string text(int col) { return reinterpret_cast<const char*>(sqlite3_column_text(st, col)); }
 
 private:
@@ -198,6 +211,11 @@ void filesystem::start(const fs_options& chosen) {
     exec(db, LOG_SCHEMA);
     guesser = predictor{};
     counters = fs_stats{};
+    dataShare = DATA_SHARE;
+    stretchReads = stretchNanos = 0;
+    atStretchStart = cache_stats{};
+    countersAtStretchStart = fs_stats{};
+    stretches.clear();
     cache.start(1, options.version == fs_version::baseline ? 0 : PREFETCH_THREADS);
     resize();
     if (options.version == fs_version::baseline) return;
@@ -215,6 +233,15 @@ void filesystem::start(const fs_options& chosen) {
         if (learned) model.learn(inode, idx);
         else guesser.observe(inode, idx, 0);
     }
+    if (!learned) return;
+
+    // And the recorded reviews of the memory split.
+    statement reviews(db,
+                      "SELECT share, data_cost, mapping_cost, read_time FROM (SELECT * FROM policy_log"
+                      " ORDER BY seq DESC LIMIT ?) ORDER BY seq");
+    reviews.bindInt(1, PAST_STRETCHES);
+    while (reviews.step())
+        model.report(reviews.real(0), reviews.real(1), reviews.real(2), reviews.real(3), 0, true);
 }
 
 void filesystem::close() {
@@ -222,6 +249,7 @@ void filesystem::close() {
     model.stop();
     cache.stop();
     index.clear();
+    indexGhost.clear();
     sqlite3_close(db);   // no-op on nullptr
     db = nullptr;
     storage.close();
@@ -407,6 +435,7 @@ std::vector<char> filesystem::read(const std::string& path, std::uint64_t offset
     if (n.isDir) fail(EISDIR, path);
     if (offset >= n.size) return {};
 
+    const auto begin = std::chrono::steady_clock::now();
     const std::uint64_t end = offset + std::min<std::uint64_t>(size, n.size - offset);
     std::vector<char> out(end - offset, 0);
     for (std::uint64_t pos = offset; pos < end;) {
@@ -419,8 +448,11 @@ std::vector<char> filesystem::read(const std::string& path, std::uint64_t offset
             std::copy_n(buf.begin() + in, len, out.begin() + (pos - offset));
         }
         if (options.version != fs_version::baseline) anticipate(n.id, idx);
+        stretchReads++;
         pos += len;
     }
+    stretchNanos += nanosSince(begin);
+    if (options.version == fs_version::adaptive && stretchReads >= STRETCH) review();
     return out;
 }
 
@@ -430,7 +462,7 @@ fs_stats filesystem::stats() {
     s.memoryBytes = cache.size() * BS + index.size() * INDEX_ENTRY_BYTES;
     s.threshold = PREFETCH_THRESHOLD;
     s.depth = PREFETCH_DEPTH;
-    s.dataShare = DATA_SHARE;
+    s.dataShare = dataShare;
     model.stats(s.modelUpdates, s.modelAccuracy);
     return s;
 }
@@ -444,6 +476,7 @@ std::int64_t filesystem::blockOf(std::int64_t inode, std::uint64_t idx, bool rea
         return *known;
     }
     counters.indexMisses++;
+    if (indexGhost.contains(key)) counters.indexGhostHits++;
 
     auto begin = std::chrono::steady_clock::now();
     std::vector<std::int64_t> found(readAhead ? READ_AHEAD_MAPPINGS : 1, -1);
@@ -458,13 +491,19 @@ std::int64_t filesystem::blockOf(std::int64_t inode, std::uint64_t idx, bool rea
 }
 
 void filesystem::remember(std::uint64_t key, std::int64_t block) {
-    index.put(key, block);
+    if (options.version != fs_version::adaptive) {   // only version C needs to know what was dropped
+        index.put(key, block);
+        return;
+    }
+    indexGhost.erase(key);
+    for (const auto& dropped : index.put(key, block)) indexGhost.put(dropped.first, 0);
 }
 
 // shortcut: drops every cached mapping, not only the affected file's; fine
 // while deletes and truncates are rare, key the cache per file if they are not.
 void filesystem::forgetMappings() {
     index.clear();
+    indexGhost.clear();
 }
 
 // Prefetches the blocks expected after this read. Version B asks its two
@@ -479,11 +518,49 @@ void filesystem::anticipate(std::int64_t inode, std::uint64_t idx) {
     }
 }
 
+// Version C: reports how the last stretch of reads went and takes up the
+// memory split the model has chosen. Nothing here decides anything; it measures
+// and passes on.
+//
+// The two costs say what a little more memory would have been worth to each
+// cache. A cache's ghost list holds what it dropped most recently, as much as
+// GHOST_SHARE more memory would still hold. A miss that is on the ghost list
+// is one that memory would have avoided, and it cost one miss in that cache: a
+// disk read for the block cache, a database query for the mapping cache.
+void filesystem::review() {
+    const cache_stats now = cache.stats();
+    auto each = [](std::uint64_t nanos, std::uint64_t count) { return count ? double(nanos) / count : 0.0; };
+    const double diskRead = each(now.diskReadNanos - atStretchStart.diskReadNanos, now.diskReads - atStretchStart.diskReads);
+    const double query = each(counters.dbLookupNanos - countersAtStretchStart.dbLookupNanos,
+                              counters.dbLookups - countersAtStretchStart.dbLookups);
+    const stretch s{dataShare, (now.ghostHits - atStretchStart.ghostHits) * diskRead,
+                    (counters.indexGhostHits - countersAtStretchStart.indexGhostHits) * query,
+                    double(stretchNanos) / stretchReads};
+    stretches.push_back(s);
+    counters.splitReports++;
+    model.report(s.share, s.dataCost, s.mappingCost, s.readTime, options.modelWaitMs);
+
+    double chosen;
+    if (model.newShare(chosen) && chosen != dataShare) {
+        dataShare = chosen;
+        resize();
+    }
+    atStretchStart = now;
+    countersAtStretchStart = counters;
+    stretchReads = stretchNanos = 0;
+}
+
 // Splits the memory budget between the two caches.
 void filesystem::resize() {
     const double bytes = double(options.cacheBytes);
-    cache.setCapacity(std::max<std::size_t>(1, std::size_t(bytes * DATA_SHARE / BS)));
-    index.setCapacity(std::max<std::size_t>(1, std::size_t(bytes * (1 - DATA_SHARE) / INDEX_ENTRY_BYTES)));
+    auto blocksIn = [&](double share) { return std::max<std::size_t>(1, std::size_t(bytes * share / BS)); };
+    auto mappingsIn = [&](double share) {
+        return std::max<std::size_t>(1, std::size_t(bytes * share / INDEX_ENTRY_BYTES));
+    };
+    cache.setCapacity(blocksIn(dataShare));
+    cache.setGhostCapacity(blocksIn(GHOST_SHARE));
+    indexGhost.setCapacity(mappingsIn(GHOST_SHARE));
+    for (const auto& dropped : index.setCapacity(mappingsIn(1 - dataShare))) indexGhost.put(dropped.first, 0);
 }
 
 void filesystem::record(std::int64_t inode, std::uint64_t idx, bool isWrite) {
@@ -494,15 +571,21 @@ void filesystem::record(std::int64_t inode, std::uint64_t idx, bool isWrite) {
 // shortcut: access_log grows without bound; trim old rows if mounts live long.
 void filesystem::flushLog() {
     try {
-        if (log.empty()) return;
+        if (log.empty() && stretches.empty()) return;
         transaction t(db);
         statement add(db, "INSERT INTO access_log (inode, idx, is_write) VALUES (?, ?, ?)");
         for (const access& a : log) {
             add.bindInt(1, a.inode).bindInt(2, std::int64_t(a.idx)).bindInt(3, a.isWrite).step();
             add.reset();
         }
+        statement found(db, "INSERT INTO policy_log (share, data_cost, mapping_cost, read_time) VALUES (?, ?, ?, ?)");
+        for (const stretch& r : stretches) {
+            found.bindReal(1, r.share).bindReal(2, r.dataCost).bindReal(3, r.mappingCost).bindReal(4, r.readTime).step();
+            found.reset();
+        }
         t.commit();
     } catch (...) {
     }
+    stretches.clear();
     log.clear();
 }

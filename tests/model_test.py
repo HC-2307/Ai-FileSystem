@@ -1,11 +1,12 @@
 """Tests for python/model.py. Run with the Python that has scikit-learn."""
+import random
 import subprocess
 import sys
 from pathlib import Path
 
 MODEL = Path(__file__).resolve().parent.parent / "python" / "model.py"
 sys.path.insert(0, str(MODEL.parent))
-from model import AHEAD, WINDOW, Model, features  # noqa: E402
+from model import AHEAD, HIGHEST, LOWEST, WINDOW, Model, Split, features  # noqa: E402
 
 
 def read(model, inode, idx):
@@ -105,15 +106,46 @@ def test_the_written_tree_predicts_the_same_as_the_model():
     assert checked > 100 and quiet > 100
 
 
+def test_split_learns_which_move_makes_reads_faster():
+    r, split = random.Random(1), Split()
+    share, read_time, right, asked = 0.7, 1000.0, 0, 0
+    for i in range(400):
+        short = r.choice((1, -1))                    # which cache is short of memory this time
+        pressure = split.note(share, 1000 if short > 0 else 0, 0 if short > 0 else 1000, read_time)
+        assert pressure == short
+        new = min(0.9, max(0.55, split.choose(share, pressure)))    # leave room to move both ways
+        move = (new > share + 1e-9) - (new < share - 1e-9)
+        share = new
+        read_time = 1000 - 200 * move * short + r.gauss(0, 60)      # helping the short cache makes reads faster
+        if i >= 40:
+            asked += 1
+            right += move == short
+    assert right > asked * 0.8                       # measured: 94%
+
+
+def test_split_stays_in_range_whatever_it_is_told():
+    split = Split()
+    share = 0.9
+    for i in range(300):
+        pressure = split.note(share, [0, 1e15, 3][i % 3], [0, 0, 1e15][i % 3], [0, 1e12, 5][i % 3])
+        assert -1 <= pressure <= 1
+        share = split.choose(share, pressure)
+        assert LOWEST <= share <= HIGHEST
+
+
 def test_speaks_the_protocol():
-    lines = ["L 1 %d" % i for i in range(20)] + ["S", "R 1 20", "nonsense", "", "S"]
+    lines = (["L 1 %d" % i for i in range(20)] + ["S", "R 1 20", "nonsense", "", "M 0.9", "S"]
+             + ["H 0.9 5 0 100", "M 0.9 0 5 100", "M 0.85 0 0 90"])
     out = subprocess.run([sys.executable, str(MODEL)], input="\n".join(lines) + "\n",
                          capture_output=True, text=True, timeout=60).stdout.splitlines()
     assert out[0] == "ready"
     count = int(out[1].split()[1])                   # the tree trained after 16 reads
-    assert out[1].split()[0] == "T" and len(out) == 1 + 1 + count + 2
+    assert out[1].split()[0] == "T" and len(out) == 1 + 1 + count + 2 + 2
     assert follow(out[1:2 + count], [1, 15, 0, 1, 0, 1]) == [0, 1] * AHEAD
-    assert out[2 + count] == "S 20" and out[3 + count] == "S 21"
+    assert out[2 + count] == "S 20" and out[3 + count] == "S 21"     # lines it cannot use get no answer
+    for answer in out[4 + count:]:                   # H gets no answer; each M gets a split
+        tag, share = answer.split()
+        assert tag == "M" and LOWEST <= float(share) <= HIGHEST
 
 
 if __name__ == "__main__":

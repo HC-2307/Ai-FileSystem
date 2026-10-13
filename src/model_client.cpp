@@ -25,6 +25,7 @@ void model_client::start(const std::string& command) {
     recent.clear();
     guessed = false;
     hitRate = 0;
+    shareArrived = false;
     signal(SIGPIPE, SIG_IGN);   // writing to a model that died must be an error, not the end of the filesystem
 
     int down[2], up[2];
@@ -111,7 +112,13 @@ void model_client::take(const std::string& line) {
     std::istringstream words(line);
     if (expected == 0) {
         std::string tag;
-        if (words >> tag && tag == "T" && words >> expected) arriving.clear();
+        double share;
+        if (!(words >> tag)) return;
+        if (tag == "T" && words >> expected) arriving.clear();
+        if (tag == "M" && words >> share && share >= 0.05 && share <= 0.95) {   // anything else is not a usable split
+            chosenShare = share;
+            shareArrived = true;
+        }
         return;
     }
     node n{-1, 0, -1, -1, false, {}};
@@ -199,6 +206,23 @@ std::vector<prediction> model_client::ask(std::int64_t inode, std::uint64_t idx,
     guessed = !next.empty();
     if (guessed) guess = {next[0].inode, std::int64_t(next[0].idx)};
     return next;
+}
+
+void model_client::report(double share, double dataCost, double mappingCost, double readTime, int waitMs, bool past) {
+    std::ostringstream line;
+    line << (past ? "H " : "M ") << share << ' ' << dataCost << ' ' << mappingCost << ' ' << readTime << '\n';
+    send(line.str());
+    std::uint64_t seen;
+    std::string answer;
+    if (waitMs > 0 && !past) sync(seen, waitMs);
+    else while (receive(answer, 0)) take(answer);
+}
+
+bool model_client::newShare(double& share) {
+    if (!shareArrived) return false;
+    shareArrived = false;
+    share = chosenShare;
+    return true;
 }
 
 void model_client::stats(std::uint64_t& seen, double& accuracy) {

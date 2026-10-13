@@ -22,7 +22,8 @@ struct file_info {
 enum class fs_version {
     baseline,   // A: LRU caches, no prefetching
     predict,    // B: A + prefetching from two hand-written detectors (predictor.h)
-    adaptive,   // C: A + prefetching from a machine-learning model trained on the reads (python/model.py)
+    adaptive,   // C: A + machine learning (python/model.py): a model trained on the reads predicts what to
+                //    prefetch, and a second one learns how to split the memory between the two caches
 };
 
 struct fs_options {
@@ -36,12 +37,14 @@ struct fs_options {
 struct fs_stats {
     cache_stats cache;
     std::uint64_t indexHits = 0, indexMisses = 0;
+    std::uint64_t indexGhostHits = 0;                 // mapping misses that a little more mapping cache would have avoided
     std::uint64_t dbLookups = 0, dbLookupNanos = 0;   // mapping queries that reached SQLite
     std::uint64_t memoryBytes = 0;                    // held by both caches right now
-    double threshold = 0, dataShare = 0;              // version B's fixed settings and the cache split
+    double threshold = 0, dataShare = 0;              // version B's fixed settings, and the block cache's part of the memory now
     int depth = 0;
     std::uint64_t modelUpdates = 0;                   // version C: reads the model has been shown
     double modelAccuracy = 0;                         // version C: running share of reads that were its first guess
+    std::uint64_t splitReports = 0;                   // version C: times the memory split was reviewed
 };
 
 // Files and directories on top of block_storage. SQLite holds the metadata
@@ -93,6 +96,7 @@ private:
     void remember(std::uint64_t key, std::int64_t block);
     void forgetMappings();
     void anticipate(std::int64_t inode, std::uint64_t idx);
+    void review();
     void resize();
     void record(std::int64_t inode, std::uint64_t idx, bool isWrite);
     void flushLog();
@@ -104,8 +108,19 @@ private:
 
     // Which block holds (file, index), so most lookups skip SQLite. -1 is a hole.
     lru<std::uint64_t, std::int64_t> index;
+    lru<std::uint64_t, char> indexGhost; // mappings dropped most recently (version C only)
     predictor guesser;                   // version B only
     model_client model;                  // version C only
     fs_stats counters;
+
+    // Version C reviews the memory split after every stretch of reads.
+    struct stretch {
+        double share, dataCost, mappingCost, readTime;
+    };
+    double dataShare = 0;                // the block cache's part of the memory
+    std::uint64_t stretchReads = 0, stretchNanos = 0;
+    cache_stats atStretchStart;
+    fs_stats countersAtStretchStart;
+    std::vector<stretch> stretches;      // not yet written to policy_log
     std::vector<access> log;             // not yet written to access_log
 };
