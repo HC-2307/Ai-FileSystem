@@ -1,39 +1,49 @@
-# Final review plan
+# Final review (Review II) plan
 
-This is the plan for presenting the project. It assumes about 15 minutes of
-talking and demo, then questions. If you get less time, drop step 5 of the
-talk and the second half of the demo.
+How the three of us present the project to the professor. The slides are in
+`docs/final_presentation.pptx` (20 slides, with speaker notes on each).
+
+Team: Harshit Choudhary (24BIT0237), Shravya Jain (24BIT0231), Arnav Aditya (24BIT0213).
 
 ## The project in one sentence
 
 A Linux filesystem that keeps its data in blocks and its metadata in SQLite,
-and uses a machine-learning model (a scikit-learn decision tree, trained on
-the reads while the filesystem runs) to predict which blocks will be read next
-and load them ahead of time.
+and uses machine learning (scikit-learn, trained on the reads while the
+filesystem runs) to predict which blocks will be read next and to share out
+its cache memory.
 
 Say this first, and say it again at the end.
 
-## Fix before the review
+## What Review II asks for, and where we show it
 
-Two things are not ready yet. Do these first.
+| The guideline asks for | Where it is shown |
+|---|---|
+| Operating system concepts used | Slide 4, and questions in the viva |
+| Complete working implementation | Demo steps 1 to 3 |
+| Testing | Demo step 6 (`ctest`), slide 11 |
+| Performance evaluation | Demo step 5, slides 13 to 16 |
+| Error handling | Demo step 4, slide 11 |
+| Demonstration of all features | Demo steps 1 to 5 |
+| Documentation | `README.md`, `docs/architecture.md`, `docs/evaluation.md`, the final report |
+| Viva voce | "Questions to expect" below |
 
-1. **`project.md` promises more than version C now does.** It lists adaptive
-   cache management, adaptive metadata indexing, cache/index co-optimization
-   and resource-aware decisions for version C. Those were hand-written rules
-   and were removed when version C became machine learning only. Version C
-   today is: prediction and prefetching by the model, and nothing else
-   adaptive. Decide which you want:
-   - update `project.md` so its version C section and research question match what was built, or
-   - leave it and say so yourself in the review (see "Say these yourself" below).
+## Who presents what
 
-   Do not let the professor find the gap first.
-2. **One cleanup commit is still pending.** It is entry 2 in `commitMem.md`
-   (the `.gitignore` line and the stray `experiments/bench_130177.db-journal`
-   file). Commit it so `git status` is clean if anyone looks.
+This is a suggested split so that every member speaks and every member can be
+asked about a part. Change it to match who actually built what.
+
+| Part | Slides | Speaker |
+|---|---|---|
+| Problem, objectives, OS concepts, architecture, storage | 1 to 7 | first member |
+| The two models, testing, the demo | 8 to 12 | second member |
+| Evaluation, limits, conclusion, future work | 13 to 20 | third member |
+
+Everyone should be able to answer the questions for every part. The faculty
+may ask any member anything.
 
 ## The day before
 
-Run all of this on the machine you will present from.
+Do all of this on the laptop you will present from.
 
 1. Build from scratch and run the tests:
 
@@ -43,168 +53,230 @@ Run all of this on the machine you will present from.
    ctest --test-dir build --output-on-failure
    ```
 
-   Expected: `100% tests passed, 0 tests failed out of 5`. It takes about a minute.
-2. Run the whole demo below once, start to finish, and time yourself.
-3. Open these in tabs, in this order: `docs/architecture.md`,
-   `python/model.py`, `src/model_client.cpp`, `experiments/read_avg_us.png`,
-   `experiments/prefetch_wasted.png`, `docs/evaluation.md`.
-4. Read "Questions to expect" below out loud once.
-5. Take screenshots of the demo output and of the two charts, in case the demo
-   fails on the day.
+   Expected: `100% tests passed, 0 tests failed out of 5`. It takes one to two minutes.
+2. Open `docs/final_presentation.pptx` in PowerPoint and click through all 20 slides. It was checked in LibreOffice, not in PowerPoint.
+3. Run the whole demo below once, start to finish, and time it.
+4. Take screenshots of each demo step and of the two charts, in case the demo fails on the day.
+5. Each member reads "Questions to expect" out loud once.
 
 ## Ten minutes before
 
-1. Check nothing is left mounted: `mountpoint build/demo/mnt` should say "is not a mountpoint" or "No such file".
-2. Open one terminal in the project folder with a large font.
+1. Nothing left mounted: `mountpoint build/demo/mnt` should say "is not a mountpoint" or "No such file".
+2. One terminal open in the project folder, large font.
 3. Close anything heavy. Timings on this machine change with what else is running.
-4. Run `ctest --test-dir build` once more.
+4. Tabs open: the slides, `python/model.py`, `src/model_client.cpp`, `docs/evaluation.md`.
 
-## The talk
+## Order of the session
 
-| # | Minutes | What to show | What to say |
-|---|---:|---|---|
-| 1 | 1 | nothing | The problem: a filesystem usually reacts to reads. If it could guess the next read, the data would already be in memory. The one-sentence description above. |
-| 2 | 2 | the layer diagram at the top of `docs/architecture.md` | How it is built: FUSE on top, the filesystem in C++, SQLite for metadata, one image file for data, an LRU cache in between. |
-| 3 | 1 | the "three versions" table in `docs/architecture.md` | Version C is the project. A (no prediction) and B (hand-written prediction) exist only so there is something to compare against. |
-| 4 | 3 | `python/model.py` | The model. Explain a "jump". The tree gets the file, the block and the last two jumps, and predicts the next four jumps. It is retrained every 256 reads on the last 2,048 reads. It only predicts from a pure leaf, which is how it stays quiet on random reads. |
-| 5 | 2 | the tree example in `docs/architecture.md`, then `predict()` in `src/model_client.cpp` | Why Python trains and C++ predicts: asking Python about every read takes about 100 microseconds, longer than a cached read. So Python sends the trained tree as lines of numbers and the filesystem follows it. Mention that you tried it the slow way first and measured it. |
-| 6 | 3 | the terminal | The demo, below. |
-| 7 | 2 | `experiments/read_avg_us.png`, then `experiments/prefetch_wasted.png` | The results, below. |
-| 8 | 1 | nothing | What it does not do well, in your own words, then the one sentence again. |
+About 15 minutes, then questions.
+
+| # | Minutes | What |
+|---|---:|---|
+| 1 | 5 | Slides 1 to 11: problem, objectives, OS concepts, architecture, the three versions, the two models, testing |
+| 2 | 5 | Slide 12, then the live demo |
+| 3 | 4 | Slides 13 to 17: setup, results, what it does not do well |
+| 4 | 1 | Slides 18 to 20: conclusion, future work, questions |
 
 ## The demo
 
-Run from the project folder. Each step says what you should see.
+Run from the project folder. Each step says what you should see. The outputs
+shown are from a rehearsal on this machine; yours will differ slightly.
 
-1. **Make a filesystem and mount it** (version C is the default):
+**1. Make a filesystem and mount it** (version C is the default):
 
-   ```sh
-   mkdir -p build/demo/mnt
-   build/ai_fs format build/demo/disk.img build/demo/disk.db 25600
-   build/ai_fs mount build/demo/disk.img build/demo/disk.db build/demo/mnt -f &
-   ```
+```sh
+mkdir -p build/demo/mnt
+build/ai_fs format build/demo/disk.img build/demo/disk.db 25600
+build/ai_fs mount build/demo/disk.img build/demo/disk.db build/demo/mnt -f &
+```
 
-   Nothing is printed. `mountpoint build/demo/mnt` says "is a mountpoint".
-2. **Use it like any folder:**
+Nothing is printed. `mountpoint build/demo/mnt` says "is a mountpoint".
 
-   ```sh
-   head -c 8000000 /dev/urandom > build/demo/big.bin
-   cp build/demo/big.bin build/demo/mnt/
-   echo hello > build/demo/mnt/note.txt
-   ls -l build/demo/mnt
-   cat build/demo/mnt/note.txt
-   cmp build/demo/big.bin build/demo/mnt/big.bin && echo identical
-   ```
+**2. Use it like any folder:**
 
-   You see both files, `hello`, and `identical`. Say: ordinary programs work on it, and what comes back is byte-for-byte what went in.
+```sh
+head -c 8000000 /dev/urandom > build/demo/big.bin
+cp build/demo/big.bin build/demo/mnt/
+echo hello > build/demo/mnt/note.txt
+mkdir build/demo/mnt/docs
+ls -l build/demo/mnt
+cmp build/demo/big.bin build/demo/mnt/big.bin && echo identical
+```
 
-   The dates show 1 January 1970. That is expected: timestamps are not stored. Say so before anyone asks.
-3. **Read the big file and unmount, to show the model working:**
+You see `big.bin`, `docs` and `note.txt`, then `identical`. Say: ordinary
+programs work on it, and what comes back is byte-for-byte what went in.
 
-   ```sh
-   cat build/demo/mnt/big.bin > /dev/null
-   fusermount3 -u build/demo/mnt
-   ```
+The dates show 1 January 1970. That is expected: timestamps are not stored.
+Say so before anyone asks.
 
-   On unmount it prints one line of statistics. In rehearsal it was:
+**3. Read the big file and unmount, to show the models working:**
 
-   ```
-   ai_fs: block reads 3909, cache hits 3849, disk reads 3908, disk writes 1955,
-   prefetched 3848 (used 3848, wasted 0), mapping queries 1956
-   ```
+```sh
+cat build/demo/mnt/big.bin > /dev/null
+```
 
-   Point at "prefetched 3848 (used 3848, wasted 0)": the model predicted nearly every block before it was asked for, and none of its predictions were wrong. Your numbers will differ slightly.
-4. **Compare the three versions on the same workload:**
+Do step 4 now, while it is still mounted, then come back and unmount:
 
-   ```sh
-   cd build
-   (./ai_fs_bench header; for v in A B C; do ./ai_fs_bench $v sequential; done) \
-     | cut -d, -f1,2,8,12,15,17 | column -s, -t
-   cd ..
-   ```
+```sh
+fusermount3 -u build/demo/mnt
+```
 
-   In rehearsal:
+On unmount it prints one line of statistics. In rehearsal:
 
-   ```
-   version  workload    read_avg_us  cache_hit_rate  prefetch_wasted  prediction_coverage
-   A        sequential  171.13       0.0000          0                0.0000
-   B        sequential  145.78       0.9967          0                0.9967
-   C        sequential  90.04        0.9962          0                0.9962
-   ```
+```
+ai_fs: block reads 3908, cache hits 3807, disk reads 3908, disk writes 1955,
+prefetched 3812 (used 3807, wasted 0), mapping queries 1956
+```
 
-   Say: same data, same cache size, only the prediction differs. This takes about ten seconds.
-5. **If there is time, the random workload:** the same command with `random` in place of `sequential`. Point at `prefetch_wasted`: B wastes about 2,000, C wastes 0.
-6. **Clean up:** `rm -rf build/demo`
+Point at "prefetched 3812 (used 3807, wasted 0)": the tree predicted nearly
+every block before it was asked for, and none of its predictions was wrong.
+
+Then show what was recorded for the models to learn from:
+
+```sh
+sqlite3 build/demo/disk.db ".tables" \
+  "select count(*) from access_log" \
+  "select round(share,2), round(read_time/1000) from policy_log limit 4"
+```
+
+In rehearsal: the five tables, 5,863 logged accesses, and rows such as
+`0.9|20.0`, `0.85|34.0`, `0.95|33.0`. Say: the first number is the share of
+memory the block cache had, the second is the average read time in
+microseconds that followed. This is the feedback the second model learns from.
+
+**4. Error handling** (while the filesystem from step 1 is still mounted):
+
+```sh
+cat build/demo/mnt/missing.txt
+rmdir build/demo/mnt/note.txt
+mkdir build/demo/mnt/docs
+```
+
+Expected: `No such file or directory`, `Not a directory`, `File exists`.
+
+A full disk, on a second, tiny filesystem of 1 MiB:
+
+```sh
+mkdir -p build/demo/small
+build/ai_fs format build/demo/s.img build/demo/s.db 256
+build/ai_fs mount build/demo/s.img build/demo/s.db build/demo/small -f &
+cp build/demo/big.bin build/demo/small/
+fusermount3 -u build/demo/small
+```
+
+Expected: `cp: error writing ... No space left on device`. Say: the write
+that did not fit was rolled back in the database, so the metadata still
+matches the blocks.
+
+**5. Compare the three versions on the same workload:**
+
+```sh
+cd build
+(./ai_fs_bench header; for v in A B C; do ./ai_fs_bench $v sequential; done) \
+  | cut -d, -f1,2,8,12,15,17 | column -s, -t
+cd ..
+```
+
+You see three rows with `read_avg_us` falling from A to B to C (about 150,
+120 and 85 in rehearsal). Say: same data, same cache size, only the policy
+differs. It takes about ten seconds.
+
+If there is time, run it again with `random` in place of `sequential` and
+point at `prefetch_wasted`: B wastes about 2,000, C wastes 0.
+
+**6. The tests** (if asked, or if there is time; one to two minutes):
+
+```sh
+ctest --test-dir build
+```
+
+Expected: `100% tests passed, 0 tests failed out of 5`.
+
+**7. Clean up:** `rm -rf build/demo`
 
 ## The results to quote
 
 Average read latency in microseconds, median of 3 runs, no think time between
 reads. All of this is in `docs/evaluation.md`.
 
-| Workload | A: no prediction | B: hand-written | C: the model |
+| Workload | A: no prediction | B: hand-written | C: machine learning |
 |---|---:|---:|---:|
-| sequential | 158 | 121 | 81 |
-| random | 315 | 300 | 254 |
-| repetitive | 303 | 193 | 121 |
-| mixed | 242 | 265 | 212 |
+| sequential | 148 | 116 | 87 |
+| random | 329 | 321 | 282 |
+| repetitive | 347 | 195 | 125 |
+| mixed | 252 | 275 | 212 |
 
-Know these four by heart:
+Know these by heart:
 
-- **Sequential:** C is about twice as fast as no prediction (81 against 158).
-- **Repetitive:** C serves 81% of reads from prefetch, B serves 77%, and C wastes none.
+- **Sequential:** C takes 87 us against 148 with no prediction.
+- **Repetitive:** C serves 82% of reads from prefetch, B serves 77%, and C wastes none.
 - **Random:** C makes no predictions at all; B wastes about 2,050 prefetches per run.
 - **Mixed:** C serves only 24% of reads from prefetch; B serves 42%. This is the weak case.
+- **Memory split:** mapping queries fall from 5,313 to 4,725 on random and from 4,660 to 2,443 on mixed, with no measurable change in read latency.
 
 ## Say these yourself
 
-Bring these up before you are asked. It reads as understanding, not weakness.
+Bring these up before you are asked. Slide 17 lists them.
 
-- **Random row:** C looks faster than A on random reads, but it prefetched nothing there, so the model is not the reason. Timings on this machine move with what else is running. Treat that row as "no difference".
-- **Mixed workload:** when the pattern keeps changing, the model is behind B. It only learns a new pattern at its next training, and only after seeing it twice.
-- **With 200 us of think time between reads:** C is level with B on sequential and behind B on mixed. C's clear wins are with reads back to back.
-- **Not everything in C is machine learning:** when C looks up a predicted block it loads 32 block mappings in one database query. That is fixed code, and it is part of why C's sequential number is low.
-- **The scope changed:** the first version C used hand-written feedback rules to tune prefetching and split cache memory. It was replaced so that version C would be machine learning only. The rules were faster on sequential and mixed reads (64 and 197 us against 81 and 212); the model is faster on repetitive (121 against 139) and wastes less.
-- **The evaluation is small:** 3 runs per case, one machine, synthetic workloads, and the model's settings were picked on these same workloads.
+- **Random row:** C looks faster than A on random reads, but it prefetched nothing there. Timings on this machine move with what else is running. Treat that row as "no reliable difference".
+- **Mixed workload:** when the pattern keeps changing, the tree is behind B. It only learns a new pattern at its next training, and only after seeing it twice.
+- **With 200 us of think time:** B is ahead of C on the mixed workload (333 against 351 us).
+- **The memory split:** it cuts database lookups but does not make reads faster. When neither cache is short of memory it has nothing to learn from; on repetitive reads it drifted to 50% and left about 400 KiB of the budget unused.
+- **Not everything in C is learned:** loading 32 block mappings per query is fixed code, and part of why C's sequential number is low.
+- **How C got here:** the first version C used hand-written feedback rules. They were replaced by the two models so that C would be machine learning only. The rules were faster on sequential and mixed reads (64 and 197 us against 87 and 212); the models are faster on repetitive (125 against 139).
+- **The evaluation is small:** 3 runs per case, one machine, synthetic workloads, and the settings were picked on these same workloads.
 
 ## Questions to expect
 
-**Why a decision tree and not a neural network?**
-Both were built and measured. A small neural network (in NumPy) predicted the mixed workload better (about 40% of reads against the tree's 20% in a replay test). The tree is better on repeating patterns, trains in about 8 milliseconds, and can be written out as a short list of questions that the filesystem follows directly. scikit-learn's own neural network took far too long to train on a window of reads to be usable here.
+**Which operating system concepts does this use?**
+File systems (blocks, inodes, directories, allocation); Linux system programming (FUSE, `pread`/`pwrite`, `O_DIRECT`, `fork`/`exec`, `poll`); inter-process communication (two pipes between the filesystem and Python); threads and synchronization (four prefetch threads, a mutex and condition variables around the cache); memory management (an LRU cache in a fixed budget, the same idea as page replacement); performance analysis.
 
-**How is this "AI" and not just a rule?**
+**How does a read travel through the system?**
+The program calls `read`. The kernel passes it to FUSE, which calls our `onRead`. The filesystem looks up the file, and for each block finds which image block holds it (mapping cache, or a SQLite query), then gets the block from the block cache or the image. It logs the access, asks the tree what comes next, and hands those blocks to the prefetch threads.
+
+**Why LRU? How is it like page replacement?**
+The cache holds a fixed number of blocks. When it is full, the block used longest ago is dropped, exactly as LRU page replacement drops a page. Prefetched blocks are put in early, and a predicted block that is already cached is marked recently used so it is not dropped just before it is needed.
+
+**Where is synchronization needed?**
+The block cache is shared by the filesystem thread and four prefetch threads. One mutex protects it. A condition variable wakes the prefetch threads when there is work, and another wakes a reader that is waiting for a block a prefetch thread is still loading.
+
+**Why a decision tree and not a neural network?**
+Both were built and measured. A small neural network predicted the mixed workload better. The tree is better on repeating patterns, trains in milliseconds, and can be written out as a short list of questions that the filesystem follows itself. scikit-learn's own neural network took far too long to train on a window of reads to be usable here.
+
+**How is this learning and not just a rule?**
 Nobody wrote "if the last jumps were +1, predict +1". The tree works that out from the recorded reads, and works out the 600-block repeating order the same way. Change the workload and the next tree is different. The C++ side only follows whatever tree it is given.
 
 **Is it overfitting? It memorises the training reads.**
 For this job memorising is partly the point: a repeating order should be remembered. The guard against memorising noise is that a leaf must hold at least two examples and they must agree. On random reads they do not agree, so nothing is predicted. The measured result is 0 wasted prefetches on random reads.
 
 **Is the test data separate from the training data?**
-Yes, by construction. The model is always trained on reads that have already happened and is judged on the reads that come after them. But the settings (window of 2,048, retrain every 256, 4 reads ahead) were chosen by trying values on these same four workloads.
+Yes, by construction. The tree is always trained on reads that have already happened and judged on the reads that come after. But the settings (window of 2,048, retrain every 256, 4 reads ahead) were chosen by trying values on these same four workloads.
 
-**What happens if the model is wrong?**
-Only speed is affected. Every read still looks up its own block and reads the cache or the disk. A wrong prediction loads a block nobody uses. The same tests run on all three versions, including one that compares every byte against an in-memory copy.
+**How does the memory split learn?**
+Every 128 reads the filesystem reports what a little more memory would have saved each cache, and how long reads took. A linear regression learns, from past moves, which move made reads faster. One time in ten it tries a random move so that it keeps learning. The reports are stored in SQLite.
+
+**What happens if a prediction is wrong?**
+Only speed is affected. Every read still looks up its own block and reads the cache or the disk. A wrong prediction loads a block nobody uses.
 
 **What happens if the Python program crashes?**
-The filesystem keeps working with the last tree it received. If Python cannot be started at all, mounting version C fails with an error message. Both cases have tests.
+The filesystem keeps working with the last tree and the last split it received. If Python cannot be started at all, mounting version C fails with an error message. Both cases have tests.
 
 **Why SQLite for metadata?**
-It gives transactions for free: a write that fails rolls back the metadata. It also stores the access log the model learns from, so a remounted filesystem starts from its history.
+It gives transactions: a write that fails rolls back the metadata. It also stores the access log and the policy log the models learn from, so a remounted filesystem starts from its history.
 
 **Why is the cache so small in the benchmark?**
 1 MiB against 16 MiB of data, about 6%. If the cache could hold everything, prefetching would have nothing to prove.
 
-**Does the model's memory count against the cache budget?**
-No. The 2,048 remembered reads, the tree and the Python process are outside it. Version B's follower table is outside it too.
-
 **Does the benchmark go through the mounted filesystem?**
 No. It calls the filesystem library directly, so FUSE's fixed cost per request is left out and the differences are easier to see. The mount is tested separately, and the demo uses it.
 
-**What would you do next?**
-Make the model react faster to a changing workload (the mixed case), test on traces from real programs, and add back adaptive cache management, this time learned.
+**Is it crash-safe?**
+No. Metadata changes are transactions, but data blocks are not journaled. This is stated as a limit.
 
 ## If something goes wrong
 
-- **The mount does not appear:** show the screenshots, and run step 4 of the demo, which needs no mount.
-- **Version C will not start ("could not start"):** the virtual environment is missing scikit-learn. Run `.venv/bin/pip install scikit-learn`, or mount with `--version B` to show the filesystem itself and use the screenshots for the model.
+- **The mount does not appear:** show the screenshots, and run demo step 5, which needs no mount.
+- **Version C will not start ("could not start"):** the virtual environment is missing scikit-learn. Run `.venv/bin/pip install scikit-learn`, or mount with `--version B` to show the filesystem itself and use the screenshots for the models.
 - **A folder is stuck mounted:** `fusermount3 -u build/demo/mnt`.
-- **A number on screen differs from this page:** that is normal; timings vary from run to run. The order of A, B and C on sequential and repetitive reads is what holds.
-- **You do not know an answer:** say what you measured and what you did not. "I did not test that" is a good answer in a final review; a guess is not.
+- **A number on screen differs from the slides:** that is normal; timings vary from run to run. The order of A, B and C on sequential and repetitive reads is what holds.
+- **You do not know an answer:** say what you measured and what you did not. "We did not test that" is a good answer in a final review; a guess is not.
